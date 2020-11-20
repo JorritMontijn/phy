@@ -16,9 +16,12 @@ wiki
 .eggs
 .profile
 __pycache__
+.pytest_cache
 _old
 *.py[cod]
 *~
+*#
+.#*
 *!
 .coverage*
 *credentials
@@ -43,3 +46,10 @@ lib64
 
 # Sphinx
 docs/_build
+
+.vscode
+*.code-workspace
+msdfgen
+*.sh
+tools/*.png
+tools/*.ttf

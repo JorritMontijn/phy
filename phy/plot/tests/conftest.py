@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 
-"""Test VisPy."""
+"""Test plot."""
 
 #------------------------------------------------------------------------------
 # Imports
 #------------------------------------------------------------------------------
 
-from vispy.app import use_app
-from pytest import yield_fixture
+from pytest import fixture, yield_fixture
 
 from ..base import BaseCanvas
 from ..panzoom import PanZoom
@@ -18,14 +17,16 @@ from ..panzoom import PanZoom
 #------------------------------------------------------------------------------
 
 @yield_fixture
-def canvas(qapp):
-    use_app('pyqt4')
-    c = BaseCanvas(keys='interactive')
+def canvas(qapp, qtbot):
+    c = BaseCanvas()
     yield c
     c.close()
+    del c
+    qtbot.wait(50)
 
 
-@yield_fixture
+@fixture
 def canvas_pz(canvas):
-    PanZoom(enable_mouse_wheel=True).attach(canvas)
-    yield canvas
+    pz = PanZoom(enable_mouse_wheel=True)
+    pz.attach(canvas)
+    return canvas

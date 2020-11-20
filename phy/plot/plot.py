@@ -7,288 +7,403 @@
 # Imports
 #------------------------------------------------------------------------------
 
-from collections import OrderedDict
-from contextlib import contextmanager
-import hashlib
-import json
 import logging
 
 import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
-from phy.io.array import _accumulate, _in_polygon
-from phy.utils._types import _as_tuple
+from .axes import Axes
 from .base import BaseCanvas
-from .interact import Grid, Boxed, Stacked
+from .interact import Grid, Boxed, Stacked, Lasso
 from .panzoom import PanZoom
-from .utils import _get_array
-from .visuals import (ScatterVisual, PlotVisual, HistogramVisual,
-                      LineVisual, TextVisual, PolygonVisual,
-                      UniformScatterVisual, UniformPlotVisual,
-                      )
+from .visuals import (
+    ScatterVisual, UniformScatterVisual, PlotVisual, UniformPlotVisual,
+    HistogramVisual, TextVisual, LineVisual, PolygonVisual,
+    DEFAULT_COLOR)
+from .transform import NDC
+from phylib.utils._types import _as_tuple
 
 logger = logging.getLogger(__name__)
-
-
-#------------------------------------------------------------------------------
-# Utils
-#------------------------------------------------------------------------------
-
-# NOTE: we ensure that we only create every type *once*, so that
-# View._items has only one key for any class.
-_CLASSES = {}
-
-
-def _hash(obj):
-    s = json.dumps(obj, sort_keys=True, ensure_ascii=True).encode('utf-8')
-    return hashlib.sha256(s).hexdigest()[:8]
-
-
-def _make_class(cls, **kwargs):
-    """Return a custom Visual class with given parameters."""
-    kwargs = {k: (v if v is not None else getattr(cls, k, None))
-              for k, v in kwargs.items()}
-    # The class name contains a hash of the custom parameters.
-    name = cls.__name__ + '_' + _hash(kwargs)
-    if name not in _CLASSES:
-        logger.log(5, "Create class %s %s.", name, kwargs)
-        cls = type(name, (cls,), kwargs)
-        _CLASSES[name] = cls
-    return _CLASSES[name]
 
 
 #------------------------------------------------------------------------------
 # Plotting interface
 #------------------------------------------------------------------------------
 
-class View(BaseCanvas):
-    """High-level plotting canvas."""
-    _default_box_index = (0,)
+class PlotCanvas(BaseCanvas):
+    """Plotting canvas that supports different layouts, subplots, lasso, axes, panzoom."""
 
-    def __init__(self, layout=None, shape=None, n_plots=None, origin=None,
-                 box_bounds=None, box_pos=None, box_size=None,
-                 enable_lasso=False,
-                 **kwargs):
-        if not kwargs.get('keys', None):
-            kwargs['keys'] = None
-        super(View, self).__init__(**kwargs)
+    _current_box_index = (0,)
+    interact = None
+    n_plots = 1
+    has_panzoom = True
+    has_axes = False
+    has_lasso = False
+    constrain_bounds = (-2, -2, +2, +2)
+    _enabled = False
+
+    def __init__(self, *args, **kwargs):
+        super(PlotCanvas, self).__init__(*args, **kwargs)
+
+    def _enable(self):
+        """Enable panzoom, axes, and lasso if required."""
+        self._enabled = True
+        if self.has_panzoom:
+            self.enable_panzoom()
+        if self.has_axes:
+            self.enable_axes()
+        if self.has_lasso:
+            self.enable_lasso()
+
+    def set_layout(
+            self, layout=None, shape=None, n_plots=None, origin=None,
+            box_pos=None, has_clip=True):
+        """Set the plot layout: grid, boxed, stacked, or None."""
+
         self.layout = layout
 
+        # Constrain pan zoom.
         if layout == 'grid':
-            self._default_box_index = (0, 0)
-            self.grid = Grid(shape)
+            self._current_box_index = (0, 0)
+            self.grid = Grid(shape, has_clip=has_clip)
             self.grid.attach(self)
             self.interact = self.grid
 
         elif layout == 'boxed':
-            self.n_plots = (len(box_bounds)
-                            if box_bounds is not None else len(box_pos))
-            self.boxed = Boxed(box_bounds=box_bounds,
-                               box_pos=box_pos,
-                               box_size=box_size)
+            self.n_plots = len(box_pos)
+            self.boxed = Boxed(box_pos=box_pos)
             self.boxed.attach(self)
             self.interact = self.boxed
 
         elif layout == 'stacked':
             self.n_plots = n_plots
-            self.stacked = Stacked(n_plots, margin=.1, origin=origin)
+            self.stacked = Stacked(n_plots, origin=origin)
             self.stacked.attach(self)
             self.interact = self.stacked
 
-        else:
-            self.interact = None
-
-        self.panzoom = PanZoom(aspect=None,
-                               constrain_bounds=[-2, -2, +2, +2])
-        self.panzoom.attach(self)
-
-        if enable_lasso:
-            self.lasso = Lasso()
-            self.lasso.attach(self)
-        else:
-            self.lasso = None
-
-        self.clear()
-
-    def clear(self):
-        """Reset the view."""
-        self._items = OrderedDict()
-        self.visuals = []
-        self.update()
-
-    def _add_item(self, cls, *args, **kwargs):
-        """Add a plot item."""
-        box_index = kwargs.pop('box_index', self._default_box_index)
-
-        data = cls.validate(*args, **kwargs)
-        n = cls.vertex_count(**data)
-
-        if not isinstance(box_index, np.ndarray):
-            k = len(self._default_box_index)
-            box_index = _get_array(box_index, (n, k))
-        data['box_index'] = box_index
-
-        if cls not in self._items:
-            self._items[cls] = []
-        self._items[cls].append(data)
-        return data
-
-    def uplot(self, *args, **kwargs):
-        cls = _make_class(UniformPlotVisual,
-                          _default_color=kwargs.pop('color', None),
-                          )
-        return self._add_item(cls, *args, **kwargs)
-
-    def plot(self, *args, **kwargs):
-        """Add a line plot."""
-        return self._add_item(PlotVisual, *args, **kwargs)
-
-    def uscatter(self, *args, **kwargs):
-        cls = _make_class(UniformScatterVisual,
-                          _default_marker=kwargs.pop('marker', None),
-                          _default_marker_size=kwargs.pop('size', None),
-                          _default_color=kwargs.pop('color', None),
-                          )
-        return self._add_item(cls, *args, **kwargs)
-
-    def scatter(self, *args, **kwargs):
-        """Add a scatter plot."""
-        cls = _make_class(ScatterVisual,
-                          _default_marker=kwargs.pop('marker', None),
-                          )
-        return self._add_item(cls, *args, **kwargs)
-
-    def hist(self, *args, **kwargs):
-        """Add some histograms."""
-        return self._add_item(HistogramVisual, *args, **kwargs)
-
-    def text(self, *args, **kwargs):
-        """Add text."""
-        return self._add_item(TextVisual, *args, **kwargs)
-
-    def lines(self, *args, **kwargs):
-        """Add some lines."""
-        return self._add_item(LineVisual, *args, **kwargs)
+        if layout == 'grid' and shape is not None:
+            self.interact.add_boxes(self)
 
     def __getitem__(self, box_index):
-        self._default_box_index = _as_tuple(box_index)
+        self._current_box_index = _as_tuple(box_index)
         return self
 
-    def build(self):
-        """Build all added items.
+    @property
+    def canvas(self):
+        return self
 
-        Visuals are created, added, and built. The `set_data()` methods can
-        be called afterwards.
+    def add_visual(self, visual, *args, **kwargs):
+        """Add a visual and possibly set some data directly.
+
+        Parameters
+        ----------
+
+        visual : Visual
+        clearable : True
+            Whether the visual should be deleted when calling `canvas.clear()`.
+        exclude_origins : list-like
+            List of interact instances that should not apply to that visual. For example, use to
+            add a visual outside of the subplots, or with no support for pan and zoom.
+        key : str
+            An optional key to identify a visual
 
         """
-        for cls, data_list in self._items.items():
-            # Some variables are not concatenated. They are specified
-            # in `allow_list`.
-            data = _accumulate(data_list, cls.allow_list)
-            box_index = data.pop('box_index')
-            visual = cls()
-            self.add_visual(visual)
-            visual.set_data(**data)
-            # NOTE: visual.program.__contains__ is implemented in vispy master
-            # so we can replace this with `if 'a_box_index' in visual.program`
-            # after the next VisPy release.
-            if 'a_box_index' in visual.program._code_variables:
-                visual.program['a_box_index'] = box_index.astype(np.float32)
-        # TODO: refactor this when there is the possibility to update existing
-        # visuals without recreating the whole scene.
-        if self.lasso:
-            self.lasso.create_visual()
-        self.update()
+        if not self._enabled:
+            self._enable()
+        # The visual is not added again if it has already been added, in which case
+        # the following call is a no-op.
+        super(PlotCanvas, self).add_visual(
+            visual,
+            # Remove special reserved keywords from kwargs, which is otherwise supposed to
+            # contain data for visual.set_data().
+            clearable=kwargs.pop('clearable', True),
+            key=kwargs.pop('key', None),
+            exclude_origins=kwargs.pop('exclude_origins', ()),
+        )
+        self.update_visual(visual, *args, **kwargs)
 
-    def get_pos_from_mouse(self, pos, box):
-        # From window coordinates to NDC (pan & zoom taken into account).
-        pos = self.panzoom.get_mouse_pos(pos)
-        # From NDC to data coordinates.
-        pos = self.interact.imap(pos, box) if self.interact else pos
-        return pos
+    def update_visual(self, visual, *args, **kwargs):
+        """Set the data of a visual, standalone or at the end of a batch."""
+        if not self._enabled:  # pragma: no cover
+            self._enable()
+        # If a batch session has been initiated in the visual, add the data from the
+        # visual's BatchAccumulator.
+        if visual._acc.items:
+            kwargs.update(visual._acc.data)
+            # If the batch accumulator has box_index, we get it in kwargs now.
+        # We remove the box_index before calling set_data().
+        box_index = kwargs.pop('box_index', None)
+        # If no data was obtained at this point, we return.
+        if box_index is None and not kwargs:
+            return visual
+        # If kwargs is not empty, we set the data on the visual.
+        data = visual.set_data(*args, **kwargs) if kwargs else None
+        # Finally, we may need to set the box index.
+        # box_index could be specified directly to add_visual, or it could have been
+        # constructed in the batch, or finally it should just be the current box index
+        # by default.
+        if self.interact and data:
+            box_index = box_index if box_index is not None else self._current_box_index
+            visual.set_box_index(box_index, data=data)
+        return visual
 
-    @contextmanager
-    def building(self):
-        """Context manager to specify the plots."""
-        self.clear()
-        yield
-        self.build()
+    # Plot methods
+    #--------------------------------------------------------------------------
+
+    def scatter(self, *args, **kwargs):
+        """Add a standalone (no batch) scatter plot."""
+        return self.add_visual(ScatterVisual(marker=kwargs.pop('marker', None)), *args, **kwargs)
+
+    def uscatter(self, *args, **kwargs):
+        """Add a standalone (no batch) uniform scatter plot."""
+        return self.add_visual(UniformScatterVisual(
+            marker=kwargs.pop('marker', None),
+            color=kwargs.pop('color', None),
+            size=kwargs.pop('size', None)), *args, **kwargs)
+
+    def plot(self, *args, **kwargs):
+        """Add a standalone (no batch) plot."""
+        return self.add_visual(PlotVisual(), *args, **kwargs)
+
+    def uplot(self, *args, **kwargs):
+        """Add a standalone (no batch) uniform plot."""
+        return self.add_visual(UniformPlotVisual(color=kwargs.pop('color', None)), *args, **kwargs)
+
+    def lines(self, *args, **kwargs):
+        """Add a standalone (no batch) line plot."""
+        return self.add_visual(LineVisual(), *args, **kwargs)
+
+    def text(self, *args, **kwargs):
+        """Add a standalone (no batch) text plot."""
+        return self.add_visual(TextVisual(color=kwargs.pop('color', None)), *args, **kwargs)
+
+    def polygon(self, *args, **kwargs):
+        """Add a standalone (no batch) polygon plot."""
+        return self.add_visual(PolygonVisual(), *args, **kwargs)
+
+    def hist(self, *args, **kwargs):
+        """Add a standalone (no batch) histogram plot."""
+        return self.add_visual(HistogramVisual(), *args, **kwargs)
+
+    # Enable methods
+    #--------------------------------------------------------------------------
+
+    def enable_panzoom(self):
+        """Enable pan zoom in the canvas."""
+        self.panzoom = PanZoom(aspect=None, constrain_bounds=self.constrain_bounds)
+        self.panzoom.attach(self)
+
+    def enable_lasso(self):
+        """Enable lasso in the canvas."""
+        self.lasso = Lasso()
+        self.lasso.attach(self)
+
+    def enable_axes(self, data_bounds=None, show_x=True, show_y=True):
+        """Show axes in the canvas."""
+        self.axes = Axes(data_bounds=data_bounds, show_x=show_x, show_y=show_y)
+        self.axes.attach(self)
 
 
 #------------------------------------------------------------------------------
-# Interactive tools
+# Matplotlib plotting interface
 #------------------------------------------------------------------------------
 
-class Lasso(object):
-    def __init__(self):
-        self._points = []
-        self.view = None
-        self.visual = None
-        self.box = None
+def _zoom_fun(ax, event):  # pragma: no cover
+    cur_xlim = ax.get_xlim()
+    cur_ylim = ax.get_ylim()
+    xdata = event.xdata
+    ydata = event.ydata
+    if xdata is None or ydata is None:
+        return
+    x_left = xdata - cur_xlim[0]
+    x_right = cur_xlim[1] - xdata
+    y_top = ydata - cur_ylim[0]
+    y_bottom = cur_ylim[1] - ydata
+    k = 1.3
+    scale_factor = {'up': 1. / k, 'down': k}.get(event.button, 1.)
+    ax.set_xlim([xdata - x_left * scale_factor,
+                 xdata + x_right * scale_factor])
+    ax.set_ylim([ydata - y_top * scale_factor,
+                 ydata + y_bottom * scale_factor])
 
-    def add(self, pos):
-        self._points.append(pos)
-        self.update_visual()
+
+_MPL_MARKER = {
+    'arrow': '>',
+    'asterisk': '*',
+    'chevron': '^',
+    'club': 'd',
+    'cross': 'x',
+    'diamond': 'D',
+    'disc': 'o',
+    'ellipse': 'o',
+    'hbar': '_',
+    'square': 's',
+    'triangle': '^',
+    'vbar': '|',
+}
+
+
+class PlotCanvasMpl(object):
+    """Matplotlib backend for a plot canvas (incomplete, work in progress)."""
+
+    _current_box_index = (0,)
+    gui = None
+    _shown = False
+    axes = None
+
+    def __init__(self, *args, **kwargs):
+        plt.style.use('dark_background')
+        mpl.rcParams['toolbar'] = 'None'
+        mpl.rcParams['axes.prop_cycle'] = mpl.cycler(color=[DEFAULT_COLOR])
+        self.figure = plt.figure()
+        self.subplots()
+
+    def set_layout(self, layout=None, shape=None, n_plots=None, origin=None, box_pos=None):
+
+        self.layout = layout
+
+        # Constrain pan zoom.
+        if layout == 'grid':
+            self.subplots(shape[0], shape[1])
+            self._current_box_index = (0, 0)
+
+        elif layout == 'boxed':  # pragma: no cover
+            self.n_plots = len(box_pos)
+            # self.boxed = Boxed(box_pos=box_pos)
+            # TODO
+            raise NotImplementedError()
+
+        elif layout == 'stacked':  # pragma: no cover
+            self.n_plots = n_plots
+            # self.stacked = Stacked(n_plots, margin=.1, origin=origin)
+            # TODO
+            raise NotImplementedError()
+
+    def subplots(self, nrows=1, ncols=1, **kwargs):
+        self.figure.clf()
+        self.axes = self.figure.subplots(nrows, ncols, squeeze=False, **kwargs)
+        for ax in self.iter_ax():
+            self.config_ax(ax)
+        return self.axes
+
+    def iter_ax(self):
+        for ax in self.axes.flat:
+            yield ax
+
+    def config_ax(self, ax):
+        xaxis = ax.get_xaxis()
+        yaxis = ax.get_yaxis()
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        xaxis.set_ticks_position('bottom')
+        xaxis.set_tick_params(direction='out')
+
+        yaxis.set_ticks_position('left')
+        yaxis.set_tick_params(direction='out')
+
+        ax.grid(color='w', alpha=.2)
+
+        def on_zoom(event):  # pragma: no cover
+            _zoom_fun(ax, event)
+            self.show()
+
+        self.canvas.mpl_connect('scroll_event', on_zoom)
+
+    def __getitem__(self, box_index):
+        self._current_box_index = _as_tuple(box_index)
+        return self
+
+    def attach_events(self, view):
+        pass
+
+    def set_lazy(self, lazy):
+        pass
 
     @property
-    def polygon(self):
-        l = self._points
-        # Close the polygon.
-        # l = l + l[0] if len(l) else l
-        out = np.array(l, dtype=np.float64)
-        out = np.reshape(out, (out.size // 2, 2))
-        assert out.ndim == 2
-        assert out.shape[1] == 2
-        return out
+    def ax(self):
+        if len(self._current_box_index) == 1:
+            return self.axes[0, self._current_box_index[0]]
+        else:
+            return self.axes[self._current_box_index]
+
+    def enable_axes(self):
+        pass
+
+    def enable_lasso(self):
+        pass
+
+    def enable_panzoom(self):
+        pass
+
+    def set_data_bounds(self, data_bounds):
+        data_bounds = data_bounds or NDC
+        assert len(data_bounds) == 4
+        x0, y0, x1, y1 = data_bounds
+        self.ax.set_xlim(x0, x1)
+        self.ax.set_ylim(y0, y1)
+
+    def scatter(
+            self, x=None, y=None, pos=None, color=None,
+            size=None, depth=None, data_bounds=None, marker=None):
+        self.ax.scatter(x, y, c=color, s=size, marker=_MPL_MARKER.get(marker, 'o'))
+        self.set_data_bounds(data_bounds)
+
+    def plot(self, x=None, y=None, color=None, depth=None, data_bounds=None):
+        self.ax.plot(x, y, c=color)
+        self.set_data_bounds(data_bounds)
+
+    def hist(self, hist=None, color=None, ylim=None):
+        assert hist is not None
+        n = len(hist)
+        x = np.linspace(-1, 1, n)
+        self.ax.bar(x, hist, width=2. / (n - 1), color=color)
+        self.set_data_bounds((-1, 0, +1, ylim))
+
+    def lines(self, pos=None, color=None, data_bounds=None):
+        pos = np.atleast_2d(pos)
+        x0, y0, x1, y1 = pos.T
+        x = np.r_[x0, x1]
+        y = np.r_[y0, y1]
+        self.ax.plot(x, y, c=color)
+        self.set_data_bounds(data_bounds)
+
+    def text(self, pos=None, text=None, anchor=None,
+             data_bounds=None, color=None):
+        pos = np.atleast_2d(pos)
+        self.ax.text(pos[:, 0], pos[:, 1], text, color=color or 'w')
+        self.set_data_bounds(data_bounds)
+
+    def polygon(self, pos=None, data_bounds=None):
+        self.ax.plot(pos[:, 0], pos[:, 1])
+        self.set_data_bounds(data_bounds)
+
+    @property
+    def canvas(self):
+        return self.figure.canvas
+
+    def attach(self, gui):
+        self.gui = gui
+        self.nav = NavigationToolbar(self.canvas, gui, coordinates=False)
+        self.nav.pan()
 
     def clear(self):
-        self._points = []
-        self.box = None
-        self.update_visual()
+        for ax in self.iter_ax():
+            ax.clear()
 
-    @property
-    def count(self):
-        return len(self._points)
+    def show(self):
+        self.canvas.draw()
+        if not self.gui and not self._shown:
+            self.nav = NavigationToolbar(self.canvas, None, coordinates=False)
+            self.nav.pan()
+        self._shown = True
 
-    def in_polygon(self, pos):
-        return _in_polygon(pos, self.polygon)
+    def update(self):  # pragma: no cover
+        return self.show()
 
-    def attach(self, view):
-        view.connect(self.on_mouse_press)
-        self.view = view
-
-    def create_visual(self):
-        self.visual = PolygonVisual()
-        self.view.add_visual(self.visual)
-        self.update_visual()
-
-    def update_visual(self):
-        if not self.visual:
-            return
-        # Update the polygon.
-        self.visual.set_data(pos=self.polygon)
-        # Set the box index for the polygon, depending on the box
-        # where the first point was clicked in.
-        box = (self.box if self.box is not None
-               else self.view._default_box_index)
-        k = len(self.view._default_box_index)
-        n = self.visual.vertex_count(pos=self.polygon)
-        box_index = _get_array(box, (n, k)).astype(np.float32)
-        self.visual.program['a_box_index'] = box_index
-        self.view.update()
-
-    def on_mouse_press(self, e):
-        if 'Control' in e.modifiers:
-            if e.button == 1:
-                # Find the box.
-                ndc = self.view.panzoom.get_mouse_pos(e.pos)
-                # NOTE: we don't update the box after the second point.
-                # In other words, the first point determines the box for the
-                # lasso.
-                if self.box is None and self.view.interact:
-                    self.box = self.view.interact.get_closest_box(ndc)
-                # Transform from window coordinates to NDC.
-                pos = self.view.get_pos_from_mouse(e.pos, self.box)
-                self.add(pos)
-            else:
-                self.clear()
-                self.box = None
+    def close(self):
+        self.canvas.close()
+        plt.close(self.figure)

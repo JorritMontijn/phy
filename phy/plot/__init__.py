@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 # flake8: noqa
 
-"""VisPy plotting."""
+"""Plotting module based on OpenGL.
+
+For advanced users!
+
+"""
 
 
 #------------------------------------------------------------------------------
@@ -10,19 +14,13 @@
 
 import os.path as op
 
-from vispy import config
-
-from .plot import View  # noqa
-from .transform import Translate, Scale, Range, Subplot, NDC
+from .base import BaseVisual, GLSLInserter, BaseCanvas, BaseLayout
+from .plot import PlotCanvas
+from .transform import Translate, Scale, Range, Subplot, NDC, TransformChain, extend_bounds
 from .panzoom import PanZoom
-from .utils import _get_linear_x
-
-
-#------------------------------------------------------------------------------
-# Add the `glsl/ path` for shader include
-#------------------------------------------------------------------------------
-
-curdir = op.dirname(op.realpath(__file__))
-glsl_path = op.join(curdir, 'glsl')
-if not config['include_path']:
-    config['include_path'] = [glsl_path]
+from .axes import AxisLocator, Axes
+from .utils import get_linear_x, BatchAccumulator
+from .interact import Grid, Boxed, Lasso
+from .visuals import (
+    ScatterVisual, UniformScatterVisual, PlotVisual, UniformPlotVisual, HistogramVisual,
+    TextVisual, LineVisual, ImageVisual, PolygonVisual)

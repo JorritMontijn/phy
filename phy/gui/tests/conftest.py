@@ -17,15 +17,20 @@ from ..gui import GUI
 #------------------------------------------------------------------------------
 
 @yield_fixture
-def gui(tempdir, qapp):
+def gui(tempdir, qtbot):
     gui = GUI(position=(200, 100), size=(100, 100), config_dir=tempdir)
+    gui.set_default_actions()
+    gui.show()
+    qtbot.addWidget(gui)
+    qtbot.waitForWindowShown(gui)
     yield gui
     gui.close()
+    del gui
 
 
 @yield_fixture
 def actions(gui):
-    yield Actions(gui)
+    yield Actions(gui, name='actions')
 
 
 @yield_fixture

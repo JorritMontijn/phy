@@ -1,83 +1,98 @@
 # -*- coding: utf-8 -*-
 
-"""Common interacts."""
+"""Common layouts."""
 
 
 #------------------------------------------------------------------------------
 # Imports
 #------------------------------------------------------------------------------
 
+import logging
 import numpy as np
-from vispy.gloo import Texture2D
 
-from .base import BaseInteract
+from phylib.utils import emit
+from phylib.utils.geometry import get_non_overlapping_boxes, get_closest_box
+
+from .base import BaseLayout
 from .transform import Scale, Range, Subplot, Clip, NDC
-from .utils import _get_texture, _get_boxes, _get_box_pos_size
-from .visuals import LineVisual
+from .utils import _get_texture, _in_polygon
+from .visuals import LineVisual, PolygonVisual
+
+logger = logging.getLogger(__name__)
 
 
 #------------------------------------------------------------------------------
-# Grid interact
+# Grid
 #------------------------------------------------------------------------------
 
-class Grid(BaseInteract):
-    """Grid interact.
+class Grid(BaseLayout):
+    """Layout showing subplots arranged in a 2D grid.
 
-    NOTE: to be used in a grid, a visual must define `a_box_index`
-    (by default) or another GLSL variable specified in `box_var`.
-
-    Parameters
-    ----------
+    Constructor
+    -----------
 
     shape : tuple or str
         Number of rows, cols in the grid.
+    shape_var : str
+        Name of the GLSL uniform variable that holds the shape, when it is variable.
     box_var : str
         Name of the GLSL variable with the box index.
+    has_clip : boolean
+        Whether subplots should be clipped.
+
+    Note
+    ----
+
+    To be used in a grid, a visual must define `a_box_index` (by default) or another GLSL
+    variable specified in `box_var`.
 
     """
 
     margin = .075
+    n_dims = 2
+    active_box = (0, 0)
+    _scaling = (1., 1.)
 
-    def __init__(self, shape=(1, 1), shape_var='u_grid_shape', box_var=None):
-        # Name of the variable with the box index.
-        self.box_var = box_var or 'a_box_index'
+    def __init__(self, shape=(1, 1), shape_var='u_grid_shape', box_var=None, has_clip=True):
+        super(Grid, self).__init__(box_var=box_var)
         self.shape_var = shape_var
         self._shape = shape
         ms = 1 - self.margin
         mc = 1 - self.margin
-        self._transforms = [Scale((ms, ms)),
-                            Clip([-mc, -mc, +mc, +mc]),
-                            Subplot(self.shape_var, self.box_var),
-                            ]
+
+        # Define the GPU transforms of the Grid layout.
+        # 1. Global scaling.
+        self.gpu_transforms.add(Scale(self._scaling, gpu_var='u_grid_scaling'))
+        # 2. Margin.
+        self.gpu_transforms.add(Scale((ms, ms)))
+        # 3. Clipping for the subplots.
+        if has_clip:
+            self.gpu_transforms.add(Clip([-mc, -mc, +mc, +mc]))
+        # 4. Subplots.
+        self.gpu_transforms.add(Subplot(
+            # The parameters of the subplots are callable as they can be changed dynamically.
+            shape=lambda: self._shape, index=lambda: self.active_box,
+            shape_gpu_var=self.shape_var, index_gpu_var=self.box_var))
 
     def attach(self, canvas):
+        """Attach the grid to a canvas."""
         super(Grid, self).attach(canvas)
-        canvas.transforms.add_on_gpu(self._transforms)
-        canvas.inserter.insert_vert("""
-                                    attribute vec2 {};
-                                    uniform vec2 {};
-                                    """.format(self.box_var, self.shape_var),
-                                    'header')
-
-    def map(self, arr, box=None):
-        assert box is not None
-        assert len(box) == 2
-        arr = self._transforms[0].apply(arr)
-        arr = Subplot(self.shape, box).apply(arr)
-        return arr
-
-    def imap(self, arr, box=None):
-        assert box is not None
-        arr = Subplot(self.shape, box).inverse().apply(arr)
-        arr = self._transforms[0].inverse().apply(arr)
-        return arr
+        canvas.gpu_transforms += self.gpu_transforms
+        canvas.inserter.insert_vert(
+            """
+            attribute vec2 {};
+            uniform vec2 {};
+            uniform vec2 u_grid_scaling;
+            """.format(self.box_var, self.shape_var),
+            'header', origin=self)
 
     def add_boxes(self, canvas, shape=None):
+        """Show subplot boxes."""
         shape = shape or self.shape
         assert isinstance(shape, tuple)
         n, m = shape
         n_boxes = n * m
-        a = 1 + .05
+        a = 1 - .0001
 
         pos = np.array([[-a, -a, +a, -a],
                         [+a, -a, +a, +a],
@@ -95,31 +110,30 @@ class Grid(BaseInteract):
 
         boxes = LineVisual()
 
-        @boxes.set_canvas_transforms_filter
-        def _remove_clip(tc):
-            return tc.remove('Clip')
-
-        canvas.add_visual(boxes)
+        # We exclude this interact when adding the visual.
+        canvas.add_visual(boxes, clearable=False)
         boxes.set_data(pos=pos)
-        boxes.program['a_box_index'] = box_index.astype(np.float32)
+        boxes.set_box_index(box_index)
+        canvas.update()
 
     def get_closest_box(self, pos):
+        """Get the box index (i, j) closest to a given position in NDC coordinates."""
         x, y = pos
         rows, cols = self.shape
         j = np.clip(int(cols * (1. + x) / 2.), 0, cols - 1)
         i = np.clip(int(rows * (1. - y) / 2.), 0, rows - 1)
         return i, j
 
-    def update_program(self, program):
-        program[self.shape_var] = self._shape
-        # Only set the default box index if necessary.
-        try:
-            program[self.box_var]
-        except KeyError:
-            program[self.box_var] = (0, 0)
+    def update_visual(self, visual):
+        """Update a visual."""
+        super(Grid, self).update_visual(visual)
+        if self.shape_var in visual.program:
+            visual.program[self.shape_var] = self._shape
+            visual.program['u_grid_scaling'] = self._scaling
 
     @property
     def shape(self):
+        """Return the grid shape."""
         return self._shape
 
     @shape.setter
@@ -127,186 +141,369 @@ class Grid(BaseInteract):
         self._shape = value
         self.update()
 
+    @property
+    def scaling(self):
+        """Return the grid scaling."""
+        return self._scaling
+
+    @scaling.setter
+    def scaling(self, value):
+        self._scaling = value
+        self.update()
+
 
 #------------------------------------------------------------------------------
-# Boxed interact
+# Boxed
 #------------------------------------------------------------------------------
 
-class Boxed(BaseInteract):
-    """Boxed interact.
+class Boxed(BaseLayout):
+    """Layout showing plots in rectangles at arbitrary positions. Used by the waveform view.
 
-    NOTE: to be used in a boxed, a visual must define `a_box_index`
-    (by default) or another GLSL variable specified in `box_var`.
+    The boxes are specified via their center positions and optional sizes, in which case
+    an iterative algorithm is used to find the largest box size that will not make them overlap.
 
-    Parameters
+    Constructor
     ----------
 
-    box_bounds : array-like
-        A (n, 4) array where each row contains the `(xmin, ymin, xmax, ymax)`
-        bounds of every box, in normalized device coordinates.
-
-        NOTE: the box bounds need to be contained within [-1, 1] at all times,
-        otherwise an error will be raised. This is to prevent silent clipping
-        of the values when they are passed to a gloo Texture2D.
-
+    box_pos : array-like (2D, shape[1] == 2)
+        Position of the centers of the boxes.
     box_var : str
         Name of the GLSL variable with the box index.
+    keep_aspect_ratio : boolean
+        Whether to keep the aspect ratio of the bounds.
+
+    Note
+    ----
+
+    To be used in a boxed layout, a visual must define `a_box_index` (by default) or another GLSL
+    variable specified in `box_var`.
 
     """
 
-    margin = 0
+    margin = .1
+    n_dims = 1
+    active_box = 0
+    _box_scaling = (1., 1.)
+    _layout_scaling = (1., 1.)
+    _scaling_param_increment = 1.1
 
-    def __init__(self,
-                 box_bounds=None,
-                 box_pos=None,
-                 box_size=None,
-                 box_var=None,
-                 keep_aspect_ratio=True,
-                 ):
+    def __init__(self, box_pos=None, box_var=None, keep_aspect_ratio=False):
+        super(Boxed, self).__init__(box_var=box_var)
         self._key_pressed = None
         self.keep_aspect_ratio = keep_aspect_ratio
 
-        # Name of the variable with the box index.
-        self.box_var = box_var or 'a_box_index'
+        self.update_boxes(box_pos)
 
-        # Find the box bounds if only the box positions are passed.
-        if box_bounds is None:
-            assert box_pos is not None
-            # This will find a good box size automatically if it is not
-            # specified.
-            box_bounds = _get_boxes(box_pos, size=box_size,
-                                    keep_aspect_ratio=self.keep_aspect_ratio,
-                                    margin=self.margin,
-                                    )
-
-        self._box_bounds = np.atleast_2d(box_bounds)
-        assert self._box_bounds.shape[1] == 4
-        self.n_boxes = len(self._box_bounds)
-
-        self._transforms = [Range(NDC, 'box_bounds')]
+        self.gpu_transforms.add(Range(
+            NDC, lambda: self.box_bounds[self.active_box],
+            from_gpu_var='vec4(-1, -1, 1, 1)', to_gpu_var='box_bounds'))
 
     def attach(self, canvas):
+        """Attach the boxed interact to a canvas."""
         super(Boxed, self).attach(canvas)
-        canvas.transforms.add_on_gpu(self._transforms)
+        canvas.gpu_transforms += self.gpu_transforms
         canvas.inserter.insert_vert("""
             #include "utils.glsl"
             attribute float {};
-            uniform sampler2D u_box_bounds;
-            uniform float n_boxes;""".format(self.box_var), 'header')
+            uniform sampler2D u_box_pos;
+            uniform float n_boxes;
+            uniform vec2 u_box_size;
+            uniform vec2 u_layout_scaling;
+            """.format(self.box_var), 'header', origin=self)
         canvas.inserter.insert_vert("""
             // Fetch the box bounds for the current box (`box_var`).
-            vec4 box_bounds = fetch_texture({},
-                                            u_box_bounds,
-                                            n_boxes);
-            box_bounds = (2 * box_bounds - 1);  // See hack in Python.
-            """.format(self.box_var), 'before_transforms')
+            vec2 box_pos = fetch_texture({}, u_box_pos, n_boxes).xy;
+            box_pos = (2 * box_pos - 1);  // from [0, 1] (texture) to [-1, 1] (NDC)
+            box_pos = box_pos * u_layout_scaling;
+            vec4 box_bounds = vec4(box_pos - u_box_size, box_pos + u_box_size);
+            """.format(self.box_var), 'start', origin=self)
 
-    def map(self, arr, box=None):
-        assert box is not None
-        assert 0 <= box < len(self.box_bounds)
-        return Range(NDC, self.box_bounds[box]).apply(arr)
+    def update_visual(self, visual):
+        """Update a visual."""
+        super(Boxed, self).update_visual(visual)
+        box_pos = _get_texture(self.box_pos, (0, 0), self.n_boxes, [-1, 1])
+        box_pos = box_pos.astype(np.float32)
+        if 'u_box_pos' in visual.program:
+            logger.log(5, "Update visual with interact Boxed.")
+            visual.program['u_box_pos'] = box_pos
+            visual.program['n_boxes'] = self.n_boxes
+            visual.program['u_box_size'] = np.array(self.box_size) * np.array(self._box_scaling)
+            visual.program['u_layout_scaling'] = self._layout_scaling
 
-    def imap(self, arr, box=None):
-        assert 0 <= box < len(self.box_bounds)
-        return Range(NDC, self.box_bounds[box]).inverse().apply(arr)
+    def update_boxes(self, box_pos):
+        """Update the box positions and automatically-computed size."""
+        self.box_pos, self.box_size = get_non_overlapping_boxes(box_pos)
 
-    def update_program(self, program):
-        # Signal bounds (positions).
-        box_bounds = _get_texture(self._box_bounds, NDC, self.n_boxes, [-1, 1])
-        box_bounds = box_bounds.astype(np.float32)
-        # TODO OPTIM: set the texture at initialization and update the data
-        program['u_box_bounds'] = Texture2D(box_bounds,
-                                            internalformat='rgba32f')
-        program['n_boxes'] = self.n_boxes
+    def add_boxes(self, canvas):
+        """Show the boxes borders."""
+        n_boxes = len(self.box_pos)
+        a = 1 + .05
+
+        pos = np.array([[-a, -a, +a, -a],
+                        [+a, -a, +a, +a],
+                        [+a, +a, -a, +a],
+                        [-a, +a, -a, -a],
+                        ])
+        pos = np.tile(pos, (n_boxes, 1))
+
+        boxes = LineVisual()
+        box_index = np.repeat(np.arange(n_boxes), 8)
+
+        canvas.add_visual(boxes, clearable=False)
+        boxes.set_data(pos=pos, color=(.5, .5, .5, 1))
+        boxes.set_box_index(box_index)
+        canvas.update()
 
     # Change the box bounds, positions, or size
     #--------------------------------------------------------------------------
 
     @property
+    def n_boxes(self):
+        """Total number of boxes."""
+        return len(self.box_pos)
+
+    @property
     def box_bounds(self):
-        return self._box_bounds
-
-    @box_bounds.setter
-    def box_bounds(self, val):
-        self._box_bounds = np.atleast_2d(val)
-        assert self._box_bounds.shape[1] == 4
-        self.n_boxes = self._box_bounds.shape[0]
-        self.update()
-
-    @property
-    def box_pos(self):
-        box_pos, _ = _get_box_pos_size(self._box_bounds)
-        return box_pos
-
-    @box_pos.setter
-    def box_pos(self, val):
-        self.box_bounds = _get_boxes(val, size=self.box_size,
-                                     margin=self.margin,
-                                     keep_aspect_ratio=self.keep_aspect_ratio)
-
-    @property
-    def box_size(self):
-        _, box_size = _get_box_pos_size(self._box_bounds)
-        return box_size
-
-    @box_size.setter
-    def box_size(self, val):
-        assert len(val) == 2
-        self.box_bounds = _get_boxes(self.box_pos, size=val,
-                                     margin=self.margin,
-                                     keep_aspect_ratio=self.keep_aspect_ratio)
+        """Bounds of the boxes."""
+        bs = np.array(self.box_size)
+        return np.c_[self.box_pos - bs, self.box_pos + bs]
 
     def get_closest_box(self, pos):
         """Get the box closest to some position."""
-        pos = np.atleast_2d(pos)
-        d = np.sum((np.array(self.box_pos) - pos) ** 2, axis=1)
-        idx = np.argmin(d)
-        return idx
+        return get_closest_box(pos, self.box_pos, self.box_size)
 
-    def update_boxes(self, box_pos, box_size):
-        """Set the box bounds from specified box positions and sizes."""
-        assert box_pos.shape == (self.n_boxes, 2)
-        assert len(box_size) == 2
-        self.box_bounds = _get_boxes(box_pos,
-                                     size=box_size,
-                                     keep_aspect_ratio=self.keep_aspect_ratio,
-                                     )
+    # Box scaling
+    #--------------------------------------------------------------------------
+
+    def _increment_box_scaling(self, cw=1., ch=1.):
+        self._box_scaling = (self._box_scaling[0] * cw, self._box_scaling[1] * ch)
+        self.update()
+
+    @property
+    def box_scaling(self):
+        return self._box_scaling
+
+    def expand_box_width(self):
+        return self._increment_box_scaling(cw=self._scaling_param_increment)
+
+    def shrink_box_width(self):
+        return self._increment_box_scaling(cw=1. / self._scaling_param_increment)
+
+    def expand_box_height(self):
+        return self._increment_box_scaling(ch=self._scaling_param_increment)
+
+    def shrink_box_height(self):
+        return self._increment_box_scaling(ch=1. / self._scaling_param_increment)
+
+    # Layout scaling
+    #--------------------------------------------------------------------------
+
+    def _increment_layout_scaling(self, cw=1., ch=1.):
+        self._layout_scaling = (self._layout_scaling[0] * cw, self._layout_scaling[1] * ch)
+        self.update()
+
+    @property
+    def layout_scaling(self):
+        return self._layout_scaling
+
+    def expand_layout_width(self):
+        return self._increment_layout_scaling(cw=self._scaling_param_increment)
+
+    def shrink_layout_width(self):
+        return self._increment_layout_scaling(cw=1. / self._scaling_param_increment)
+
+    def expand_layout_height(self):
+        return self._increment_layout_scaling(ch=self._scaling_param_increment)
+
+    def shrink_layout_height(self):
+        return self._increment_layout_scaling(ch=1. / self._scaling_param_increment)
 
 
 class Stacked(Boxed):
-    """Stacked interact.
-
-    NOTE: to be used in a stacked, a visual must define `a_box_index`
-    (by default) or another GLSL variable specified in `box_var`.
+    """Layout showing a number of subplots stacked vertically.
 
     Parameters
     ----------
 
     n_boxes : int
         Number of boxes to stack vertically.
-    margin : int (0 by default)
-        The margin between the stacked subplots. Can be negative. Must be
-        between -1 and 1. The unit is relative to each box's size.
     box_var : str
         Name of the GLSL variable with the box index.
+    origin : str
+        top or bottom
+
+    Note
+    ----
+
+    To be used in a boxed layout, a visual must define `a_box_index` (by default) or another GLSL
+    variable specified in `box_var`.
 
     """
-    def __init__(self, n_boxes, margin=0, box_var=None, origin=None):
+    margin = 0
+    _origin = 'bottom'
 
-        # The margin must be in [-1, 1]
-        margin = np.clip(margin, -1, 1)
-        # Normalize the margin.
-        margin = 2. * margin / float(n_boxes)
+    def __init__(self, n_boxes, box_var=None, origin=None):
+        self._origin = origin or self._origin
+        assert self._origin in ('top', 'bottom')
+        box_pos = self.get_box_pos(n_boxes)
+        super(Stacked, self).__init__(box_pos, box_var=box_var, keep_aspect_ratio=False)
 
+    @property
+    def n_boxes(self):
+        """Number of boxes."""
+        return len(self.box_pos)
+
+    @n_boxes.setter
+    def n_boxes(self, n_boxes):
+        if n_boxes >= 1:
+            self.update_boxes(self.get_box_pos(n_boxes))
+
+    def get_box_pos(self, n_boxes):
+        """Return the box bounds for a given number of stacked boxes."""
         # Signal bounds.
-        b = np.zeros((n_boxes, 4))
-        b[:, 0] = -1
-        b[:, 1] = np.linspace(-1, 1 - 2. / n_boxes + margin, n_boxes)
-        b[:, 2] = 1
-        b[:, 3] = np.linspace(-1 + 2. / n_boxes - margin, 1., n_boxes)
-        if origin == 'upper':
+        b = np.zeros((n_boxes, 2))
+        b[:, 1] = np.linspace(-1, 1, n_boxes)
+        if self._origin == 'top':
             b = b[::-1, :]
+        return b
 
-        super(Stacked, self).__init__(b, box_var=box_var,
-                                      keep_aspect_ratio=False,
-                                      )
+    @property
+    def origin(self):
+        """Whether to show the channels from top to bottom (`top` option, the default), or from
+        bottom to top (`bottom`)."""
+        return self._origin
+
+    @origin.setter
+    def origin(self, value):
+        self._origin = value
+        self.update_boxes(self.get_box_pos(self.n_boxes))
+        self.update()
+
+    def attach(self, canvas):
+        """Attach the stacked interact to a canvas."""
+        BaseLayout.attach(self, canvas)
+        canvas.gpu_transforms += self.gpu_transforms
+        canvas.inserter.insert_vert("""
+            #include "utils.glsl"
+            attribute float {};
+            uniform float n_boxes;
+            uniform bool u_top_origin;
+            uniform vec2 u_box_size;
+            """.format(self.box_var), 'header', origin=self)
+        canvas.inserter.insert_vert("""
+            float margin = .1 / n_boxes;
+            float a = 1 - 2. / n_boxes + margin;
+            float b = -1 + 2. / n_boxes - margin;
+            float u = (u_top_origin ? (n_boxes - 1. - {bv}) : {bv}) / max(1., n_boxes - 1.);
+            float y0 = -1 + u * (a + 1);
+            float y1 = b + u * (1 - b);
+            float ym = .5 * (y0 + y1);
+            float yh = u_box_size.y * (y1 - ym);
+            y0 = ym - yh;
+            y1 = ym + yh;
+            vec4 box_bounds = vec4(-1., y0, +1., y1);
+        """.format(bv=self.box_var), 'before_transforms', origin=self)
+
+    def update_visual(self, visual):
+        """Update a visual."""
+        BaseLayout.update_visual(self, visual)
+        if 'n_boxes' in visual.program:
+            visual.program['n_boxes'] = self.n_boxes
+            visual.program['u_box_size'] = self._box_scaling
+            visual.program['u_top_origin'] = self._origin == 'top'
+
+
+#------------------------------------------------------------------------------
+# Interactive tools
+#------------------------------------------------------------------------------
+
+class Lasso(object):
+    """Draw a polygon with the mouse and find the points that belong to the inside of the
+    polygon."""
+    def __init__(self):
+        self._points = []
+        self.canvas = None
+        self.visual = None
+        self.box = None
+
+    def add(self, pos):
+        """Add a point to the polygon."""
+        x, y = pos.flat if isinstance(pos, np.ndarray) else pos
+        self._points.append((x, y))
+        logger.debug("Lasso has %d points.", len(self._points))
+        self.update_lasso_visual()
+
+    @property
+    def polygon(self):
+        """Coordinates of the polygon vertices."""
+        l = self._points
+        # Close the polygon.
+        # l = l + l[0] if len(l) else l
+        out = np.array(l, dtype=np.float64)
+        out = np.reshape(out, (out.size // 2, 2))
+        assert out.ndim == 2
+        assert out.shape[1] == 2
+        return out
+
+    def clear(self):
+        """Reset the lasso."""
+        self._points = []
+        self.box = None
+        self.update_lasso_visual()
+
+    @property
+    def count(self):
+        """Number of vertices in the polygon."""
+        return len(self._points)
+
+    def in_polygon(self, pos):
+        """Return which points belong to the polygon."""
+        return _in_polygon(pos, self.polygon)
+
+    def attach(self, canvas):
+        """Attach the lasso to a canvas."""
+        canvas.attach_events(self)
+        self.canvas = canvas
+        self.create_lasso_visual()
+
+    def create_lasso_visual(self):
+        """Create the lasso visual."""
+        self.visual = PolygonVisual()
+        self.canvas.add_visual(self.visual, clearable=False)
+
+    def update_lasso_visual(self):
+        """Update the lasso visual with the current polygon."""
+        if not self.visual and self.count > 0:
+            return
+        # The following call updates a_box_index with the active box in BaseLayout.
+        self.visual.set_data(pos=self.polygon)
+        self.canvas.update()
+
+    def on_mouse_click(self, e):
+        """Add a polygon point with ctrl+click."""
+        if 'Control' in e.modifiers:
+            if e.button == 'Left':
+                layout = getattr(self.canvas, 'layout', None)
+                if hasattr(layout, 'box_map'):
+                    box, pos = layout.box_map(e.pos)
+                    # Only update the box for the first click, so that the box containing
+                    # the lasso is determined by the first click only.
+                    if self.box is None:
+                        self.box = box
+                    # Avoid clicks outside the active box (box of the first click).
+                    if box != self.box:
+                        return
+                else:  # pragma: no cover
+                    pos = self.canvas.window_to_ndc(e.pos)
+                # Force the active box to be the box of the first click, not the box of the
+                # current click.
+                if layout:
+                    layout.active_box = self.box
+                self.add(pos)  # call update_lasso_visual
+                emit("lasso_updated", self.canvas, self.polygon)
+            else:
+                self.clear()
+                self.box = None
+
+    def __repr__(self):
+        return str(self.polygon)

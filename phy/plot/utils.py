@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-"""Plotting/VisPy utilities."""
+"""Plotting utilities."""
 
 
 #------------------------------------------------------------------------------
@@ -8,111 +8,13 @@
 #------------------------------------------------------------------------------
 
 import logging
-import os.path as op
+from pathlib import Path
 
 import numpy as np
-from six import string_types
-from vispy import gloo
 
-from .transform import Range, NDC
+from phylib.utils import Bunch, _as_array
 
 logger = logging.getLogger(__name__)
-
-
-#------------------------------------------------------------------------------
-# Box positioning
-#------------------------------------------------------------------------------
-
-def _boxes_overlap(x0, y0, x1, y1):
-    n = len(x0)
-    overlap_matrix = ((x0 < x1.T) & (x1 > x0.T) & (y0 < y1.T) & (y1 > y0.T))
-    overlap_matrix[np.arange(n), np.arange(n)] = False
-    return np.any(overlap_matrix.ravel())
-
-
-def _binary_search(f, xmin, xmax, eps=1e-9):
-    """Return the largest x such f(x) is True."""
-    middle = (xmax + xmin) / 2.
-    while xmax - xmin > eps:
-        assert xmin < xmax
-        middle = (xmax + xmin) / 2.
-        if f(xmax):
-            return xmax
-        if not f(xmin):
-            return xmin
-        if f(middle):
-            xmin = middle
-        else:
-            xmax = middle
-    return middle
-
-
-def _get_box_size(x, y, ar=.5, margin=0):
-    logger.log(5, "Get box size for %d points.", len(x))
-    # Deal with degenerate x case.
-    xmin, xmax = x.min(), x.max()
-    if xmin == xmax:
-        # If all positions are vertical, the width can be maximum.
-        wmax = 1.
-    else:
-        wmax = xmax - xmin
-
-    def f1(w):
-        """Return true if the configuration with the current box size
-        is non-overlapping."""
-        # NOTE: w|h are the *half* width|height.
-        h = w * ar  # fixed aspect ratio
-        return not _boxes_overlap(x - w, y - h, x + w, y + h)
-
-    # Find the largest box size leading to non-overlapping boxes.
-    w = _binary_search(f1, 0, wmax)
-    w = w * (1 - margin)  # margin
-    # Clip the half-width.
-    h = w * ar  # aspect ratio
-
-    return w, h
-
-
-def _get_boxes(pos, size=None, margin=0, keep_aspect_ratio=True):
-    """Generate non-overlapping boxes in NDC from a set of positions."""
-
-    # Get x, y.
-    pos = np.asarray(pos, dtype=np.float64)
-    x, y = pos.T
-    x = x[:, np.newaxis]
-    y = y[:, np.newaxis]
-
-    w, h = size if size is not None else _get_box_size(x, y, margin=margin)
-
-    x0, y0 = x - w, y - h
-    x1, y1 = x + w, y + h
-
-    # Renormalize the whole thing by keeping the aspect ratio.
-    x0min, y0min, x1max, y1max = x0.min(), y0.min(), x1.max(), y1.max()
-    if not keep_aspect_ratio:
-        b = (x0min, y0min, x1max, y1max)
-    else:
-        dx = x1max - x0min
-        dy = y1max - y0min
-        if dx > dy:
-            b = (x0min, (y1max + y0min) / 2. - dx / 2.,
-                 x1max, (y1max + y0min) / 2. + dx / 2.)
-        else:
-            b = ((x1max + x0min) / 2. - dy / 2., y0min,
-                 (x1max + x0min) / 2. + dy / 2., y1max)
-    r = Range(from_bounds=b,
-              to_bounds=(-1, -1, 1, 1))
-    return np.c_[r.apply(np.c_[x0, y0]), r.apply(np.c_[x1, y1])]
-
-
-def _get_box_pos_size(box_bounds):
-    box_bounds = np.asarray(box_bounds)
-    x0, y0, x1, y1 = box_bounds.T
-    w = (x1 - x0) * .5
-    h = (y1 - y0) * .5
-    x = (x0 + x1) * .5
-    y = (y0 + y1) * .5
-    return np.c_[x, y], (w.mean(), h.mean())
 
 
 #------------------------------------------------------------------------------
@@ -168,47 +70,8 @@ def _get_array(val, shape, default=None, dtype=np.float64):
     return out
 
 
-def _check_data_bounds(data_bounds):
-    assert data_bounds.ndim == 2
-    assert data_bounds.shape[1] == 4
-    assert np.all(data_bounds[:, 0] < data_bounds[:, 2])
-    assert np.all(data_bounds[:, 1] < data_bounds[:, 3])
-
-
-def _get_data_bounds(data_bounds, pos=None, length=None):
-    """"Prepare data bounds, possibly using min/max of the data."""
-    if data_bounds is None or (isinstance(data_bounds, string_types) and
-                               data_bounds == 'auto'):
-        if pos is not None and len(pos):
-            m, M = pos.min(axis=0), pos.max(axis=0)
-            data_bounds = [m[0], m[1], M[0], M[1]]
-        else:
-            data_bounds = NDC
-    data_bounds = np.atleast_2d(data_bounds)
-
-    ind_x = data_bounds[:, 0] == data_bounds[:, 2]
-    ind_y = data_bounds[:, 1] == data_bounds[:, 3]
-    if np.sum(ind_x):
-        data_bounds[ind_x, 0] -= 1
-        data_bounds[ind_x, 2] += 1
-    if np.sum(ind_y):
-        data_bounds[ind_y, 1] -= 1
-        data_bounds[ind_y, 3] += 1
-
-    # Extend the data_bounds if needed.
-    if length is None:
-        length = pos.shape[0] if pos is not None else 1
-    if data_bounds.shape[0] == 1:
-        data_bounds = np.tile(data_bounds, (length, 1))
-
-    # Check the shape of data_bounds.
-    assert data_bounds.shape == (length, 4)
-
-    _check_data_bounds(data_bounds)
-    return data_bounds
-
-
 def _get_pos(x, y):
+    """Ensure x and y are valid position arrays."""
     assert x is not None
     assert y is not None
 
@@ -231,8 +94,100 @@ def _get_index(n_items, item_size, n):
     return index
 
 
-def _get_linear_x(n_signals, n_samples):
+def get_linear_x(n_signals, n_samples):
+    """Get a vertical stack of arrays ranging from -1 to 1.
+
+    Return a `(n_signals, n_samples)` array.
+
+    """
     return np.tile(np.linspace(-1., 1., n_samples), (n_signals, 1))
+
+
+class BatchAccumulator(object):
+    """Accumulate data arrays for batch visuals.
+
+    This class is used to simplify the creation of batch visuals, where different visual elements
+    of the same type are concatenated into a singual Visual instance, which significantly
+    improves the performance of OpenGL.
+
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset the accumulator."""
+        self.items = {}
+        self.noconcat = ()
+
+    def add(self, b, noconcat=(), n_items=None, n_vertices=None, **kwargs):
+        """Add data for a given batch iteration.
+
+        Parameters
+        ----------
+
+        b : Bunch
+            Data to add to the current batch iteration.
+        noconcat : tuple
+            List of keys that should not be concatenated.
+        n_items : int
+            Number of visual items to add in this batch iteration.
+        n_vertices : int
+            Number of vertices added in this batch iteration.
+
+        Note
+        ----
+
+        `n_items` and `n_vertices` differ for special visuals, like `TextVisual` where each
+        item is a string, but is represented in OpenGL as a number of vertices (six times the
+        number of characters, as each character requires two triangles).
+
+        """
+        b.update(kwargs)
+        self.noconcat = noconcat
+        assert n_items >= 0  # number of items for the current batch that is being added
+        # This may be smaller than the number of vertices, for example in LineVisual, where every
+        # item is a 4-tuple (x0, y0, x1, y1) that corresponds to 2 vertices.
+        for key, val in b.items():
+            if key not in self.items:
+                self.items[key] = []
+            if val is None:
+                continue
+            # Size of the second dimension.
+            if isinstance(val, np.ndarray):
+                if val.ndim == 1:
+                    val = np.c_[val]
+                assert val.ndim == 2
+                n, k = val.shape
+            elif isinstance(val, (tuple, list)):
+                k = len(val)
+            else:
+                k = 1
+            # Special consideration for variables that are lists and not arrays, and that
+            # should not be concatenated here.
+            if key in noconcat:
+                self.items[key].extend(val)
+            else:
+                size = n_items if key != 'box_index' else n_vertices
+                val = _get_array(val, (size, k))
+                self.items[key].append(val)
+        return b
+
+    def __getattr__(self, key):
+        if key not in self.items:
+            raise AttributeError()
+        arrs = self.items.get(key)
+        if not arrs:
+            return None
+        # Special consideration for list of strings (text visual).
+        if key in self.noconcat:
+            return arrs
+        return np.concatenate(arrs, axis=0)
+
+    @property
+    def data(self):
+        """Return the concatenated data as a dictionary."""
+        return Bunch({key: getattr(self, key) for key in self.items.keys()})
 
 
 #------------------------------------------------------------------------------
@@ -241,15 +196,15 @@ def _get_linear_x(n_signals, n_samples):
 
 def _load_shader(filename):
     """Load a shader file."""
-    curdir = op.dirname(op.realpath(__file__))
-    glsl_path = op.join(curdir, 'glsl')
-    path = op.join(glsl_path, filename)
-    with open(path, 'r') as f:
-        return f.read()
+    path = Path(__file__).parent / 'glsl' / filename
+    if not path.exists():
+        return
+    return path.read_text()
 
 
 def _tesselate_histogram(hist):
-    """
+    """Return the vertices of triangles composing a histogram."""
+    r"""
 
     2/4  3
      ____
@@ -277,12 +232,14 @@ def _tesselate_histogram(hist):
     return np.c_[x, y]
 
 
-def _enable_depth_mask():
-    gloo.set_state(clear_color='black',
-                   depth_test=True,
-                   depth_range=(0., 1.),
-                   # depth_mask='true',
-                   depth_func='lequal',
-                   blend=True,
-                   blend_func=('src_alpha', 'one_minus_src_alpha'))
-    gloo.set_clear_depth(1.0)
+def _in_polygon(points, polygon):
+    """Return the points that are inside a polygon."""
+    from matplotlib.path import Path
+    points = _as_array(points)
+    polygon = _as_array(polygon)
+    assert points.ndim == 2
+    assert polygon.ndim == 2
+    if len(polygon):
+        polygon = np.vstack((polygon, polygon[0]))
+    path = Path(polygon, closed=True)
+    return path.contains_points(points)

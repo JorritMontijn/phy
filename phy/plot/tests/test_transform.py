@@ -12,12 +12,11 @@ from textwrap import dedent
 import numpy as np
 from numpy.testing import assert_equal as ae
 from numpy.testing import assert_allclose as ac
-from pytest import yield_fixture
+from pytest import fixture
 
-from ..transform import (_glslify, pixels_to_ndc, _normalize,
-                         Translate, Scale, Range, Clip, Subplot,
-                         TransformChain,
-                         )
+from ..transform import (
+    _glslify, pixels_to_ndc, _normalize, extend_bounds,
+    Translate, Scale, Rotate, Range, Clip, Subplot, TransformChain)
 
 
 #------------------------------------------------------------------------------
@@ -68,6 +67,11 @@ def test_normalize():
     ac(_normalize(arr, m, m), arr)
 
 
+def test_extend_bounds():
+    assert extend_bounds([(0, 0, 1, 1), (-1, -2, 3, 4)]) == (-1, -2, 3, 4)
+    assert extend_bounds([(0, 0, 0, 0)]) == (-1, -1, 1, 1)
+
+
 #------------------------------------------------------------------------------
 # Test transform
 #------------------------------------------------------------------------------
@@ -86,11 +90,20 @@ def test_translate_cpu():
     _check(Translate([1, 2]).inverse(), [4, 6], [[3, 4]])
     _check(Translate(np.array([[1, 2]])).inverse(), [4, 6], [[3, 4]])
 
+    # Callable.
+    _check(Translate(lambda: [1, 2]), [3, 4], [[4, 6]])
+
 
 def test_scale_cpu():
     _check(Scale([-1, 2]), [3, 4], [[-3, 8]])
     _check(Scale([-1, 2]).inverse(), [-3, 8], [[3, 4]])
     _check(Scale(np.array([[-1, 2]])).inverse(), [-3, 8], [[3, 4]])
+
+
+def test_rotate_cpu():
+    _check(Rotate(), [1, 0], [[0, -1]])
+    _check(Rotate('ccw'), [0, 1], [[-1, 0]])
+    _check(Rotate().inverse(), [1, 1], [[-1, 1]])
 
 
 def test_range_cpu():
@@ -145,23 +158,26 @@ def test_subplot_cpu():
 #------------------------------------------------------------------------------
 
 def test_translate_glsl():
-    assert 'x = x + u_translate' in Translate('u_translate').glsl('x')
-    assert 'x + -u_translate' in Translate('u_translate').inverse().glsl('x')
+    assert 'x = x + u_translate' in Translate(gpu_var='u_translate').glsl('x')
+    assert 'x + -u_translate' in Translate(gpu_var='u_translate').inverse().glsl('x')
 
 
 def test_scale_glsl():
-    assert 'x = x * u_scale' in Scale('u_scale').glsl('x')
-    assert 'x = x * 1.0 / u_scale' in Scale('u_scale').inverse().glsl('x')
+    assert 'x = x * u_scale' in Scale(gpu_var='u_scale').glsl('x')
+    assert 'x = x * 1.0 / u_scale' in Scale(gpu_var='u_scale').inverse().glsl('x')
+
+
+def test_rotate_glsl():
+    assert 'pos = vec2(-pos.y, pos.x)' in Rotate('ccw').glsl('pos')
+    assert 'pos = -vec2(-pos.y, pos.x)' in Rotate('cw').glsl('pos')
 
 
 def test_range_glsl():
 
     assert Range([-1, -1, 1, 1]).glsl('x')
-
-    expected = ('u_to.xy + (u_to.zw - u_to.xy) * (x - u_from.xy) / '
-                '(u_from.zw - u_from.xy)')
     r = Range('u_from', 'u_to')
-    assert expected in r.glsl('x')
+    assert 'x = (x - ' in r.glsl('x')
+    assert 'u_from' in r.glsl('x')
 
 
 def test_clip_glsl():
@@ -185,16 +201,15 @@ def test_subplot_glsl():
 # Test transform chain
 #------------------------------------------------------------------------------
 
-@yield_fixture
+@fixture
 def array():
-    yield np.array([[-1., 0.], [1., 2.]])
+    return np.array([[-1., 0.], [1., 2.]])
 
 
 def test_transform_chain_empty(array):
     t = TransformChain()
 
-    assert t.cpu_transforms == []
-    assert t.gpu_transforms == []
+    assert t.transforms == []
 
     ae(t.apply(array), array)
 
@@ -202,10 +217,9 @@ def test_transform_chain_empty(array):
 def test_transform_chain_one(array):
     translate = Translate([1, 2])
     t = TransformChain()
-    t.add_on_cpu([translate])
+    t.add([translate])
 
-    assert t.cpu_transforms == [translate]
-    assert t.gpu_transforms == []
+    assert t.transforms == [translate]
 
     ae(t.apply(array), [[0, 2], [2, 4]])
 
@@ -213,11 +227,11 @@ def test_transform_chain_one(array):
 def test_transform_chain_two(array):
     translate = Translate([1, 2])
     scale = Scale([.5, .5])
-    t = TransformChain()
-    t.add_on_cpu([translate, scale])
+    t = TransformChain([translate, scale])
 
-    assert t.cpu_transforms == [translate, scale]
-    assert t.gpu_transforms == []
+    assert t.transforms == [translate, scale]
+    assert t[0] == translate
+    assert t[1] == scale
 
     assert isinstance(t.get('Translate'), Translate)
     assert t.get('Unknown') is None
@@ -226,33 +240,26 @@ def test_transform_chain_two(array):
 
 
 def test_transform_chain_complete(array):
-    t = TransformChain()
-    t.add_on_cpu([Scale(.5), Scale(2.)])
-    t.add_on_cpu(Range([-3, -3, 1, 1]))
-    t.add_on_gpu(Clip())
-    t.add_on_gpu([Subplot('u_shape', 'a_box_index')])
-
-    assert len(t.cpu_transforms) == 3
-    assert len(t.gpu_transforms) == 2
-
+    t = Scale(.5) + Scale(2.) + Range([-3, -3, 1, 1]) + Subplot('u_shape', 'a_box_index')
+    assert len(t.transforms) == 4
     ae(t.apply(array), [[0, .5], [1, 1.5]])
-
-    assert len(t.remove('Scale').cpu_transforms) == len(t.cpu_transforms) - 2
 
 
 def test_transform_chain_add():
     tc = TransformChain()
-    tc.add_on_cpu([Scale(.5)])
+    tc.add([Scale(.5)])
 
     tc_2 = TransformChain()
-    tc_2.add_on_cpu([Scale(2.)])
+    tc_2.add([Scale(2.)])
 
     ae((tc + tc_2).apply([3.]), [[3.]])
+
+    assert str(tc)
 
 
 def test_transform_chain_inverse():
     tc = TransformChain()
-    tc.add_on_cpu([Scale(.5), Translate((1, 0)), Scale(2)])
+    tc.add([Scale(.5), Translate((1, 0)), Scale(2)])
     tci = tc.inverse()
     ae(tc.apply([[1., 0.]]), [[3., 0.]])
     ae(tci.apply([[3., 0.]]), [[1., 0.]])

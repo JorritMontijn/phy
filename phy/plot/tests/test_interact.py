@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-"""Test interact."""
+"""Test layout."""
 
 
 #------------------------------------------------------------------------------
@@ -13,15 +13,20 @@ import numpy as np
 from numpy.testing import assert_equal as ae
 from numpy.testing import assert_allclose as ac
 
-from ..base import BaseVisual
-from ..interact import Grid, Boxed, Stacked
+from ..base import BaseVisual, BaseCanvas
+from ..interact import Grid, Boxed, Stacked, Lasso
 from ..panzoom import PanZoom
 from ..transform import NDC
+from ..visuals import ScatterVisual
+from . import mouse_click
 
 
 #------------------------------------------------------------------------------
 # Fixtures
 #------------------------------------------------------------------------------
+
+N = 10000
+
 
 class MyTestVisual(BaseVisual):
     def __init__(self):
@@ -29,8 +34,9 @@ class MyTestVisual(BaseVisual):
         self.vertex_shader = """
             attribute vec2 a_position;
             void main() {
-                gl_Position = transform(a_position);
-                gl_PointSize = 2.;
+                vec2 xy = a_position.xy;
+                gl_Position = transform(xy);
+                gl_PointSize = 5.;
             }
         """
         self.fragment_shader = """
@@ -41,39 +47,35 @@ class MyTestVisual(BaseVisual):
         self.set_primitive_type('points')
 
     def set_data(self):
-        n = 1000
-
-        coeff = [(1 + i + j) for i, j in product(range(2), range(3))]
-        coeff = np.repeat(coeff, n)
-        coeff = coeff[:, None]
-
-        position = .1 * coeff * np.random.randn(2 * 3 * n, 2)
-
+        self.n_vertices = N
+        position = np.random.uniform(low=-1, high=+1, size=(N, 2))
+        self.data = position
         self.program['a_position'] = position.astype(np.float32)
 
+        self.emit_visual_set_data()
 
-def _create_visual(qtbot, canvas, interact, box_index):
+
+def _create_visual(qtbot, canvas, layout, box_index):
     c = canvas
 
-    # Attach the interact *and* PanZoom. The order matters!
-    interact.attach(c)
+    # Attach the layout *and* PanZoom. The order matters!
+    layout.attach(c)
     PanZoom(aspect=None, constrain_bounds=NDC).attach(c)
 
     visual = MyTestVisual()
     c.add_visual(visual)
     visual.set_data()
-
-    visual.program['a_box_index'] = box_index.astype(np.float32)
+    visual.set_box_index(box_index)
 
     c.show()
-    qtbot.waitForWindowShown(c.native)
+    qtbot.waitForWindowShown(c)
 
 
 #------------------------------------------------------------------------------
 # Test grid
 #------------------------------------------------------------------------------
 
-def test_grid_interact():
+def test_grid_layout():
     grid = Grid((4, 8))
     ac(grid.map([0., 0.], (0, 0)), [[-0.875, 0.75]])
     ac(grid.map([0., 0.], (1, 3)), [[-0.125, 0.25]])
@@ -93,12 +95,12 @@ def test_grid_closest_box():
 
 def test_grid_1(qtbot, canvas):
 
-    n = 1000
+    n = N // 10
 
-    box_index = [[i, j] for i, j in product(range(2), range(3))]
+    box_index = [[i, j] for i, j in product(range(2), range(5))]
     box_index = np.repeat(box_index, n, axis=0)
 
-    grid = Grid((2, 3))
+    grid = Grid((2, 5))
     _create_visual(qtbot, canvas, grid, box_index)
 
     grid.add_boxes(canvas)
@@ -108,15 +110,18 @@ def test_grid_1(qtbot, canvas):
 
 def test_grid_2(qtbot, canvas):
 
-    n = 1000
+    n = N // 10
 
-    box_index = [[i, j] for i, j in product(range(2), range(3))]
+    box_index = [[i, j] for i, j in product(range(2), range(5))]
     box_index = np.repeat(box_index, n, axis=0)
 
     grid = Grid()
     _create_visual(qtbot, canvas, grid, box_index)
-    grid.shape = (3, 3)
-    assert grid.shape == (3, 3)
+    grid.shape = (5, 2)
+    assert grid.shape == (5, 2)
+
+    grid.scaling = (.5, 2)
+    assert grid.scaling == (.5, 2)
 
     # qtbot.stop()
 
@@ -127,68 +132,66 @@ def test_grid_2(qtbot, canvas):
 
 def test_boxed_1(qtbot, canvas):
 
-    n = 6
-    b = np.zeros((n, 4))
+    n = 10
+    b = np.zeros((n, 2))
+    b[:, 1] = np.linspace(-1., 1., n)
 
-    b[:, 0] = b[:, 1] = np.linspace(-1., 1. - 1. / 3., n)
-    b[:, 2] = b[:, 3] = np.linspace(-1. + 1. / 3., 1., n)
+    box_index = np.repeat(np.arange(n), N // n, axis=0)
+    assert box_index.shape == (N,)
 
-    n = 1000
-    box_index = np.repeat(np.arange(6), n, axis=0)
-
-    boxed = Boxed(box_bounds=b)
+    boxed = Boxed(box_pos=b)
     _create_visual(qtbot, canvas, boxed, box_index)
+    boxed.add_boxes(canvas)
 
-    ae(boxed.box_bounds, b)
-    boxed.box_bounds = b
+    assert boxed.box_scaling == (1, 1)
+    assert boxed.layout_scaling == (1, 1)
 
-    boxed.update_boxes(boxed.box_pos, boxed.box_size)
-    ac(boxed.box_bounds, b)
+    ac(boxed.box_pos[:, 0], 0, atol=1e-9)
+    assert boxed.box_size[0] >= .9
+    assert boxed.box_size[1] >= .05
+
+    assert boxed.box_bounds.shape == (n, 4)
+
+    boxed.expand_box_width()
+    boxed.shrink_box_width()
+    boxed.expand_box_height()
+    boxed.shrink_box_height()
+    boxed.expand_layout_width()
+    boxed.shrink_layout_width()
+    boxed.expand_layout_height()
+    boxed.shrink_layout_height()
 
     # qtbot.stop()
 
 
 def test_boxed_2(qtbot, canvas):
-    """Test setting the box position and size dynamically."""
+    from ..visuals import PlotAggVisual
 
-    n = 1000
-    pos = np.c_[np.zeros(6), np.linspace(-1., 1., 6)]
-    box_index = np.repeat(np.arange(6), n, axis=0)
+    n = 10
+    b = np.zeros((n, 2))
+    b[:, 1] = np.linspace(-1., 1., n)
 
-    boxed = Boxed(box_pos=pos)
-    _create_visual(qtbot, canvas, boxed, box_index)
+    box_index = np.repeat(np.arange(n), 2 * (N + 2), axis=0)
 
-    boxed.box_pos *= .25
-    boxed.box_size = [1, .1]
+    boxed = Boxed(box_pos=b)
+    c = canvas
+    boxed.attach(c)
+    PanZoom(aspect=None, constrain_bounds=NDC).attach(c)
 
-    idx = boxed.get_closest_box((.5, .25))
-    assert idx == 4
+    t = np.linspace(-1, 1, N)
+    x = np.atleast_2d(t)
+    y = np.atleast_2d(.5 * np.sin(20 * t))
 
-    # qtbot.stop()
+    x = np.tile(x, (n, 1))
+    y = np.tile(y, (n, 1))
 
+    visual = PlotAggVisual()
+    c.add_visual(visual)
+    visual.set_data(x=x, y=y)
+    visual.set_box_index(box_index)
 
-def test_boxed_interact():
-
-    n = 8
-    b = np.zeros((n, 4))
-    b[:, 0] = b[:, 1] = np.linspace(-1., 1. - 1. / 4., n)
-    b[:, 2] = b[:, 3] = np.linspace(-1. + 1. / 4., 1., n)
-
-    boxed = Boxed(box_bounds=b)
-    ac(boxed.map([0., 0.], 0), [[-.875, -.875]])
-    ac(boxed.map([0., 0.], 7), [[.875, .875]])
-    ac(boxed.imap([[.875, .875]], 7), [[0., 0.]])
-
-
-def test_boxed_closest_box():
-    b = np.array([[-.5, -.5, 0., 0.],
-                  [0., 0., +.5, +.5]])
-    boxed = Boxed(box_bounds=b)
-
-    ac(boxed.get_closest_box((-1, -1)), 0)
-    ac(boxed.get_closest_box((-0.001, 0)), 0)
-    ac(boxed.get_closest_box((+0.001, 0)), 1)
-    ac(boxed.get_closest_box((-1, +1)), 0)
+    c.show()
+    qtbot.waitForWindowShown(c)
 
 
 #------------------------------------------------------------------------------
@@ -197,20 +200,115 @@ def test_boxed_closest_box():
 
 def test_stacked_1(qtbot, canvas):
 
-    n = 1000
-    box_index = np.repeat(np.arange(6), n, axis=0)
+    n = 10
+    box_index = np.repeat(np.arange(n), N // n, axis=0)
 
-    stacked = Stacked(n_boxes=6, margin=-10, origin='upper')
+    stacked = Stacked(n_boxes=n, origin='top')
     _create_visual(qtbot, canvas, stacked, box_index)
+
+    assert stacked.origin == 'top'
+
+    stacked.origin = 'bottom'
+    assert stacked.origin == 'bottom'
 
     # qtbot.stop()
 
 
 def test_stacked_closest_box():
-    stacked = Stacked(n_boxes=4, origin='upper')
+    stacked = Stacked(n_boxes=4, origin='top')
     ac(stacked.get_closest_box((-.5, .9)), 0)
     ac(stacked.get_closest_box((+.5, -.9)), 3)
 
-    stacked = Stacked(n_boxes=4, origin='lower')
+    stacked = Stacked(n_boxes=4, origin='bottom')
     ac(stacked.get_closest_box((-.5, .9)), 3)
     ac(stacked.get_closest_box((+.5, -.9)), 0)
+
+    stacked.n_boxes = 3
+
+
+#------------------------------------------------------------------------------
+# Test lasso
+#------------------------------------------------------------------------------
+
+def test_lasso_simple(qtbot):
+    view = BaseCanvas()
+
+    x = .25 * np.random.randn(N)
+    y = .25 * np.random.randn(N)
+
+    scatter = ScatterVisual()
+    view.add_visual(scatter)
+    scatter.set_data(x=x, y=y)
+
+    l = Lasso()
+    l.attach(view)
+    l.create_lasso_visual()
+
+    view.show()
+    #qtbot.waitForWindowShown(view)
+
+    l.add((-.5, -.5))
+    l.add((+.5, -.5))
+    l.add((+.5, +.5))
+    l.add((-.5, +.5))
+    assert l.count == 4
+    assert l.polygon.shape == (4, 2)
+    b = [[-.5, -.5], [+.5, -.5], [+.5, +.5], [-.5, +.5]]
+    ae(l.in_polygon(b), [False, False, True, True])
+    assert str(l)
+
+    # qtbot.stop()
+    view.close()
+
+
+def test_lasso_grid(qtbot, canvas):
+    grid = Grid((1, 2))
+    grid.attach(canvas)
+
+    PanZoom(aspect=None).attach(canvas)
+    grid.add_boxes(canvas)
+
+    visual = MyTestVisual()
+    canvas.add_visual(visual)
+    # Right panel.
+    box_index = np.zeros((N, 2), dtype=np.float32)
+    box_index[:, 1] = 1
+    visual.program['a_box_index'] = box_index
+    visual.set_data()
+
+    # lasso interact
+    l = Lasso()
+    l.attach(canvas)
+    l.create_lasso_visual()
+    l.update_lasso_visual()
+
+    canvas.show()
+    qtbot.waitForWindowShown(canvas)
+    qtbot.wait(20)
+
+    def _ctrl_click(x, y, button='left'):
+        mouse_click(qtbot, canvas, (x, y), button=button, modifiers=('Control',))
+
+    # Square selection in the right panel.
+    w, h = canvas.get_size()
+    x0 = w / 2 + 100
+    x1 = x0 + 200
+    y0 = 100
+    y1 = 300
+    _ctrl_click(x0, y0)
+    _ctrl_click(x1, y0)
+    _ctrl_click(x1, y1)
+    _ctrl_click(x0, y1)
+    assert l.polygon.shape == (4, 2)
+    assert l.box == (0, 1)
+
+    inlasso = l.in_polygon(visual.data)
+    assert .001 < inlasso.mean() < .999
+
+    # Clear box.
+    _ctrl_click(x0, y0, 'right')
+    assert l.polygon.shape == (0, 2)
+    assert l.box is None
+
+    qtbot.wait(20)
+    canvas.close()

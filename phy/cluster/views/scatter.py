@@ -7,13 +7,14 @@
 # Imports
 # -----------------------------------------------------------------------------
 
+import inspect
 import logging
 
 import numpy as np
 
-from phy.utils._color import _colormap
-from .base import ManualClusteringView
-from phy.plot import NDC
+from phy.utils.color import selected_cluster_color, spike_colors
+from .base import ManualClusteringView, MarkerSizeMixin, LassoMixin
+from phy.plot.visuals import ScatterVisual
 
 logger = logging.getLogger(__name__)
 
@@ -22,59 +23,96 @@ logger = logging.getLogger(__name__)
 # Scatter view
 # -----------------------------------------------------------------------------
 
-class ScatterView(ManualClusteringView):
-    _default_marker_size = 5.
+class ScatterView(MarkerSizeMixin, LassoMixin, ManualClusteringView):
+    """This view displays a scatter plot for all selected clusters.
 
-    def __init__(self,
-                 coords=None,  # function clusters: Bunch(x, y)
-                 **kwargs):
+    Constructor
+    -----------
 
+    coords : function
+        Maps `cluster_ids` to a list `[Bunch(x, y, spike_ids, data_bounds), ...]` for each cluster.
+
+    """
+
+    _default_position = 'right'
+
+    default_shortcuts = {
+        'change_marker_size': 'alt+wheel',
+    }
+
+    def __init__(self, coords=None, **kwargs):
+        super(ScatterView, self).__init__(**kwargs)
+        # Save the marker size in the global and local view's config.
+
+        self.canvas.enable_axes()
+        self.canvas.enable_lasso()
         assert coords
         self.coords = coords
+        self.visual = ScatterVisual()
+        self.canvas.add_visual(self.visual)
 
-        # Initialize the view.
-        super(ScatterView, self).__init__(**kwargs)
+    def _plot_cluster(self, bunch):
+        ms = self._marker_size
+        self.visual.add_batch_data(
+            pos=bunch.pos, color=bunch.color, size=ms, data_bounds=self.data_bounds)
 
-    def _get_data(self, cluster_ids):
-        return [self.coords(cluster_id) for cluster_id in cluster_ids]
+    def _get_split_cluster_data(self, bunchs):
+        """Get the data when there is one Bunch per cluster."""
+        # Add a pos attribute in bunchs in addition to x and y.
+        for i, (cluster_id, bunch) in enumerate(zip(self.cluster_ids, bunchs)):
+            bunch.cluster_id = cluster_id
+            if 'pos' not in bunch:
+                assert bunch.x.ndim == 1
+                assert bunch.x.shape == bunch.y.shape
+                bunch.pos = np.c_[bunch.x, bunch.y]
+            assert bunch.pos.ndim == 2
+            assert 'spike_ids' in bunch
+            bunch.color = selected_cluster_color(i, .75)
+        return bunchs
 
-    def _get_data_bounds(self, bunchs):
-        if not bunchs:  # pragma: no cover
-            return NDC
-        data_bounds = bunchs[0].get('data_bounds', None)
-        if data_bounds is None:
-            xmin = np.min([d.x.min() for d in bunchs])
-            ymin = np.min([d.y.min() for d in bunchs])
-            xmax = np.max([d.x.max() for d in bunchs])
-            ymax = np.max([d.y.max() for d in bunchs])
-            data_bounds = (xmin, ymin, xmax, ymax)
-        return data_bounds
+    def _get_collated_cluster_data(self, bunch):
+        """Get the data when there is a single Bunch for all selected clusters."""
+        assert 'spike_ids' in bunch
+        if 'pos' not in bunch:
+            assert bunch.x.ndim == 1
+            assert bunch.x.shape == bunch.y.shape
+            bunch.pos = np.c_[bunch.x, bunch.y]
+        assert bunch.pos.ndim == 2
+        bunch.color = spike_colors(bunch.spike_clusters, self.cluster_ids)
+        return bunch
 
-    def _plot_points(self, bunchs, data_bounds):
-        for i, d in enumerate(bunchs):
-            x, y = d.x, d.y
-            assert x.ndim == y.ndim == 1
-            assert x.shape == y.shape
+    def get_clusters_data(self, load_all=None):
+        """Return a list of Bunch instances, with attributes pos and spike_ids."""
+        if not load_all:
+            bunchs = self.coords(self.cluster_ids) or ()
+        elif 'load_all' in inspect.signature(self.coords).parameters:
+            bunchs = self.coords(self.cluster_ids, load_all=load_all) or ()
+        else:
+            logger.warning(
+                "The view `%s` may not load all spikes when using the lasso for splitting.",
+                self.__class__.__name__)
+            bunchs = self.coords(self.cluster_ids)
+        if isinstance(bunchs, dict):
+            return [self._get_collated_cluster_data(bunchs)]
+        elif isinstance(bunchs, (list, tuple)):
+            return self._get_split_cluster_data(bunchs)
+        raise ValueError("The output of `coords()` should be either a list of Bunch, or a Bunch.")
 
-            self.scatter(x=x, y=y,
-                         color=tuple(_colormap(i)) + (.5,),
-                         size=self._default_marker_size,
-                         data_bounds=data_bounds,
-                         )
-
-    def on_select(self, cluster_ids=None, **kwargs):
-        super(ScatterView, self).on_select(cluster_ids, **kwargs)
-        cluster_ids = self.cluster_ids
-        n_clusters = len(cluster_ids)
-        if n_clusters == 0:
+    def plot(self, **kwargs):
+        """Update the view with the current cluster selection."""
+        bunchs = self.get_clusters_data()
+        # Hide the visual if there is no data.
+        if not bunchs:
+            self.visual.hide()
+            self.canvas.update()
             return
+        self.data_bounds = self._get_data_bounds(bunchs)
 
-        # Retrieve the data.
-        bunchs = self._get_data(cluster_ids)
+        self.visual.reset_batch()
+        for bunch in bunchs:
+            self._plot_cluster(bunch)
+        self.canvas.update_visual(self.visual)
+        self.visual.show()
 
-        # Compute the data bounds.
-        data_bounds = self._get_data_bounds(bunchs)
-
-        # Plot the points.
-        with self.building():
-            self._plot_points(bunchs, data_bounds)
+        self._update_axes()
+        self.canvas.update()

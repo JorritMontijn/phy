@@ -6,20 +6,29 @@
 # Imports
 #------------------------------------------------------------------------------
 
+from functools import partial
+
 from pytest import raises
 
-from ..actions import (_show_shortcuts,
-                       _get_shortcut_string,
-                       _get_qkeysequence,
-                       _parse_snippet,
-                       Actions,
-                       )
-from phy.utils.testing import captured_output, captured_logging
+from ..actions import (
+    _show_shortcuts, _show_snippets, _get_shortcut_string, _get_qkeysequence, _parse_snippet,
+    _expected_args, Actions)
+from phylib.utils.testing import captured_output, captured_logging
+from ..qt import mock_dialogs
 
 
 #------------------------------------------------------------------------------
 # Test actions
 #------------------------------------------------------------------------------
+
+def test_expected_args():
+    assert _expected_args(lambda: 0) == ()
+    assert _expected_args(lambda a: 0) == ('a',)
+    assert _expected_args(lambda a, b: 0) == ('a', 'b')
+    assert _expected_args(lambda self, a: 0) == ('a',)
+    assert _expected_args(lambda a, b=0: 0) == ('a',)
+    assert _expected_args(partial(lambda a, b: 0, 0)) == ('b',)
+
 
 def test_shortcuts(qapp):
     assert 'z' in _get_shortcut_string('Undo')
@@ -49,13 +58,22 @@ def test_show_shortcuts(qapp):
         'test_3': 'ctrl+z',
     }
     with captured_output() as (stdout, stderr):
-        _show_shortcuts(shortcuts, 'test')
+        _show_shortcuts(shortcuts)
     assert 'ctrl+a, shift+b' in stdout.getvalue()
     assert 'ctrl+z' in stdout.getvalue()
 
 
+def test_show_snippets():
+    snippets = {
+        'test_1 (note)': 't1',
+    }
+    with captured_output() as (stdout, stderr):
+        _show_snippets(snippets)
+    assert ':t1' in stdout.getvalue()
+
+
 def test_actions_default_shortcuts(gui):
-    actions = Actions(gui, default_shortcuts={'my_action': 'a'})
+    actions = Actions(gui, default_shortcuts={'my_action': 'a'}, name='actions')
     actions.add(lambda: None, name='my_action')
     assert actions.shortcuts['my_action'] == 'a'
 
@@ -82,7 +100,7 @@ def test_actions_simple(actions):
 
     actions.show_my_shortcuts()
     assert 'show_my_shortcuts' in _captured[0]
-    assert ': h' in _captured[0]
+    assert 'h\n' in _captured[0]
 
     actions.run('t', 1)
     assert _res == [(1,)]
@@ -102,13 +120,18 @@ def test_actions_simple(actions):
 def test_actions_gui_menu(qtbot, gui, actions):
     qtbot.addWidget(gui)
 
-    @actions.add(shortcut='g', menu='&File')
+    @actions.add(shortcut='g', menu='&File', icon='f0c7', toolbar=True)
     def press():
-        pass
+        print("press")
 
-    actions.separator('File')
+    actions.separator(menu='&File')
 
     gui.show()
+    qtbot.waitForWindowShown(gui)
+
+    actions.get('press').trigger()
+
+    gui.close()
     # qtbot.stop()
 
 
@@ -133,25 +156,81 @@ def test_actions_gui(qtbot, gui, actions):
 
     # Show default action shortcuts.
     with captured_output() as (stdout, stderr):
-        gui.default_actions.show_shortcuts()
+        gui.file_actions.show_shortcuts()
     assert 'q\n' in stdout.getvalue()
 
     # Show all action shortcuts.
     with captured_output() as (stdout, stderr):
-        gui.default_actions.show_all_shortcuts()
+        gui.help_actions.show_all_shortcuts()
     assert 'g\n' in stdout.getvalue()
 
 
-def test_actions_dialog(qtbot, gui, actions):
+def test_actions_submenu(qtbot, gui, actions):
+    @actions.add(menu='&File', submenu='Submenu')
+    def my_action():
+        pass
+
     qtbot.addWidget(gui)
     gui.show()
     qtbot.waitForWindowShown(gui)
 
-    @actions.add(shortcut='a')
-    def hello(arg):
-        pass
-
     # qtbot.stop()
+    gui.close()
+
+
+def test_actions_checkable(qtbot, gui, actions):
+    qtbot.addWidget(gui)
+    gui.show()
+    qtbot.waitForWindowShown(gui)
+
+    _l = []
+
+    @actions.add(shortcut='c', checkable=True, menu='&File')
+    def toggle(checked):
+        _l.append(checked)
+
+    actions.get('toggle').trigger()
+    actions.get('toggle').trigger()
+    assert _l == [True, False]
+
+
+def test_actions_dialog_1(qtbot, gui, actions):
+
+    @actions.add(shortcut='a', prompt=True)
+    def hello(arg):
+        print("hello", arg)
+
+    qtbot.addWidget(gui)
+    gui.show()
+    qtbot.waitForWindowShown(gui)
+
+    with captured_output() as (stdout, stderr):
+        with mock_dialogs(('world', True)):
+            # return string, ok
+            actions.get('hello').trigger()
+    assert 'hello world' in stdout.getvalue()
+
+
+def test_actions_dialog_2(qtbot, gui, actions):
+
+    @actions.add(shortcut='a', prompt=True)
+    def hello(arg1, arg2):
+        print("hello", arg1, arg2)
+
+    qtbot.addWidget(gui)
+    gui.show()
+    qtbot.waitForWindowShown(gui)
+
+    with captured_output() as (stdout, stderr):
+        with mock_dialogs(('world world', True)):
+            # return string, ok
+            actions.get('hello').trigger()
+    assert 'hello world' in stdout.getvalue()
+
+    with captured_logging('phy.gui.actions') as buf:
+        with mock_dialogs(('world', True)):
+            actions.get('hello').trigger()
+    assert 'invalid' in buf.getvalue().lower()
 
 
 def test_actions_disable(qtbot, gui, actions):
@@ -218,12 +297,12 @@ def test_snippets_gui(qtbot, gui, actions):
 def test_snippets_parse():
     def _check(args, expected):
         snippet = 'snip ' + args
-        assert _parse_snippet(snippet) == ['snip'] + expected
+        assert _parse_snippet(snippet) == tuple(['snip'] + expected)
 
     _check('a', ['a'])
     _check('abc', ['abc'])
     _check('a,b,c', [['a', 'b', 'c']])
-    _check('a b,c', ['a', ['b', 'c']])
+    _check('a b,C', ['a', ['b', 'C']])
 
     _check('1', [1])
     _check('10', [10])
@@ -256,19 +335,20 @@ def test_snippets_errors(actions, snippets):
         assert len(str(arg)) == 1
         _actions.append(arg)
 
-    with captured_logging() as buf:
+    logging_name = 'phy.gui.actions'
+    with captured_logging(logging_name) as buf:
         snippets.run(':t1')
     assert 'couldn\'t' in buf.getvalue().lower()
 
-    with captured_logging() as buf:
+    with captured_logging(logging_name) as buf:
         snippets.run(':t')
-    assert 'error' in buf.getvalue().lower()
+    assert 'invalid' in buf.getvalue().lower()
 
-    with captured_logging() as buf:
+    with captured_logging(logging_name) as buf:
         snippets.run(':t 1 2')
-    assert 'error' in buf.getvalue().lower()
+    assert 'invalid' in buf.getvalue().lower()
 
-    with captured_logging() as buf:
+    with captured_logging(logging_name) as buf:
         snippets.run(':t aa')
     assert 'assert 2 == 1' in buf.getvalue()
 

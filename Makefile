@@ -14,14 +14,21 @@ clean: clean-build clean-pyc
 lint:
 	flake8 phy
 
+# Test everything except apps.
 test: lint
-	py.test --cov-report term-missing --cov=phy phy
+	py.test --cov-report= --cov=phy phy --ignore=phy/apps/ --cov-append
+	coverage report --omit */phy/apps/*,*/phy/plot/gloo/*
 
-coverage:
-	coverage --html
+# Test just the apps.
+test-apps: lint
+	py.test --cov-report term-missing --cov=phy.apps phy/apps/ --cov-append
 
-apidoc:
-	python tools/api.py
+# Test everything.
+test-full: test test-apps
+	coverage report --omit */phy/plot/gloo/*
+
+doc:
+	python tools/api.py && python tools/extract_shortcuts.py && python tools/plugins_doc.py
 
 build:
 	python setup.py sdist --formats=zip

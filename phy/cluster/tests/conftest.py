@@ -8,8 +8,11 @@
 
 from pytest import fixture
 
-from phy.io.array import (get_closest_clusters,
-                          )
+from phylib.io.array import get_closest_clusters
+import phy.gui.qt
+
+# Reduce the debouncer delay for tests.
+phy.gui.qt.Debouncer.delay = 1
 
 
 #------------------------------------------------------------------------------
@@ -28,10 +31,8 @@ def cluster_groups():
 
 
 @fixture
-def quality():
-    def quality(c):
-        return c
-    return quality
+def cluster_labels():
+    return {'test_label': {10: 123, 0: 456}, 'group': {}}
 
 
 @fixture

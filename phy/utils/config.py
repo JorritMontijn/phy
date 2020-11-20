@@ -1,20 +1,17 @@
 # -*- coding: utf-8 -*-
 
-"""Config."""
+"""Configuration utilities based on the traitlets package."""
 
 #------------------------------------------------------------------------------
 # Imports
 #------------------------------------------------------------------------------
 
 import logging
-import os
-import os.path as op
+from pathlib import Path
 from textwrap import dedent
 
-from traitlets.config import (Config,
-                              PyFileConfigLoader,
-                              JSONFileConfigLoader,
-                              )
+from traitlets.config import Config, PyFileConfigLoader, JSONFileConfigLoader
+from phylib.utils._misc import ensure_dir_exists, phy_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -23,47 +20,32 @@ logger = logging.getLogger(__name__)
 # Config
 #------------------------------------------------------------------------------
 
-def phy_config_dir():
-    """Return the absolute path to the phy user directory."""
-    home = op.realpath(op.expanduser('~'))
-    return op.join(home, '.phy')
-
-
-def _ensure_dir_exists(path):
-    """Ensure a directory exists."""
-    if not op.exists(path):
-        os.makedirs(path)
-    assert op.exists(path) and op.isdir(path)
-
-
 def load_config(path=None):
-    """Load a Python or JSON config file."""
-    if not path or not op.exists(path):
+    """Load a Python or JSON config file and return a `Config` instance."""
+    if not path:
         return Config()
-    path = op.realpath(path)
-    dirpath, filename = op.split(path)
-    file_ext = op.splitext(path)[1]
+    path = Path(path)
+    if not path.exists():  # pragma: no cover
+        return Config()
+    file_ext = path.suffix
     logger.debug("Load config file `%s`.", path)
     if file_ext == '.py':
-        config = PyFileConfigLoader(filename, dirpath,
-                                    log=logger).load_config()
+        config = PyFileConfigLoader(path.name, str(path.parent), log=logger).load_config()
     elif file_ext == '.json':
-        config = JSONFileConfigLoader(filename, dirpath,
-                                      log=logger).load_config()
+        config = JSONFileConfigLoader(path.name, str(path.parent), log=logger).load_config()
     return config
 
 
 def _default_config(config_dir=None):
-    path = op.join(config_dir or op.join('~', '.phy'), 'plugins/')
+    """Default configuration Python file, with a plugin placeholder."""
+
+    if not config_dir:  # pragma: no cover
+        config_dir = Path.home() / '.phy'
+    path = config_dir / 'plugins'
     return dedent("""
     # You can also put your plugins in ~/.phy/plugins/.
 
     from phy import IPlugin
-
-    try:
-        import phycontrib
-    except:
-        pass
 
     # Plugin example:
     #
@@ -78,21 +60,25 @@ def _default_config(config_dir=None):
 
 
 def load_master_config(config_dir=None):
-    """Load a master Config file from `~/.phy/phy_config.py`."""
+    """Load a master Config file from the user configuration file (by default, this is
+    `~/.phy/phy_config.py`)."""
     config_dir = config_dir or phy_config_dir()
-    path = op.join(config_dir, 'phy_config.py')
+    path = config_dir / 'phy_config.py'
     # Create a default config file if necessary.
-    if not op.exists(path):
-        _ensure_dir_exists(op.dirname(path))
+    if not path.exists():
+        ensure_dir_exists(path.parent)
         logger.debug("Creating default phy config file at `%s`.", path)
-        with open(path, 'w') as f:
-            f.write(_default_config(config_dir=config_dir))
-    assert op.exists(path)
-    return load_config(path)
+        path.write_text(_default_config(config_dir=config_dir))
+    assert path.exists()
+    try:
+        return load_config(path)
+    except Exception as e:  # pragma: no cover
+        logger.error(e)
+        return {}
 
 
 def save_config(path, config):
-    """Save a config object to a JSON file."""
+    """Save a Config instance to a JSON file."""
     import json
     config['version'] = 1
     with open(path, 'w') as f:

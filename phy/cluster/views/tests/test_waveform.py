@@ -8,51 +8,63 @@
 
 import numpy as np
 from numpy.testing import assert_allclose as ac
-from vispy.util import keys
 
-from phy.electrode.mea import staggered_positions
-from phy.gui import GUI
-from phy.io.mock import artificial_waveforms
-from phy.utils import Bunch
+from phylib.io.mock import artificial_waveforms
+from phylib.utils import Bunch, connect
+from phylib.utils.geometry import staggered_positions
+from phy.plot.tests import mouse_click, key_press, key_release
 
 from ..waveform import WaveformView
+from . import _stop_and_close
 
 
 #------------------------------------------------------------------------------
 # Test waveform view
 #------------------------------------------------------------------------------
 
-def test_waveform_view(qtbot, tempdir):
+def test_waveform_view(qtbot, tempdir, gui):
     nc = 5
+    ns = 10
+
+    w = 10 + 100 * artificial_waveforms(ns, 20, nc)
 
     def get_waveforms(cluster_id):
-        return Bunch(data=artificial_waveforms(10, 20, nc),
-                     channel_ids=np.arange(nc),
-                     channel_positions=staggered_positions(nc),
-                     )
+        return Bunch(
+            data=w,
+            masks=np.random.uniform(low=0., high=1., size=(ns, nc)),
+            channel_ids=np.arange(nc),
+            channel_labels=['%d' % (ch * 10) for ch in range(nc)],
+            channel_positions=staggered_positions(nc))
 
-    v = WaveformView(waveforms=get_waveforms,
-                     )
-    gui = GUI(config_dir=tempdir)
-    gui.show()
+    v = WaveformView(
+        waveforms={'waveforms': get_waveforms, 'mean_waveforms': get_waveforms},
+        sample_rate=10000.,
+    )
+    v.show()
+    qtbot.waitForWindowShown(v.canvas)
     v.attach(gui)
-    qtbot.addWidget(gui)
 
-    v.on_select([])
-    v.on_select([0])
-    v.on_select([0, 2, 3])
-    v.on_select([0, 2])
+    v.on_select(cluster_ids=[])
+    v.on_select(cluster_ids=[0])
+    v.on_select(cluster_ids=[0, 2, 3])
+    v.on_select(cluster_ids=[0, 2])
 
-    v.toggle_waveform_overlap()
-    v.toggle_waveform_overlap()
+    v.toggle_waveform_overlap(True)
+    v.toggle_waveform_overlap(False)
 
-    v.toggle_show_labels()
-    v.toggle_show_labels()
+    v.toggle_show_labels(False)
+    v.toggle_show_labels(True)
+
+    v.next_waveforms_type()
+    v.previous_waveforms_type()
+    v.toggle_mean_waveforms(True)
+    v.toggle_mean_waveforms(False)
 
     # Box scaling.
     bs = v.boxed.box_size
     v.increase()
     v.decrease()
+    v.reset_scaling()
     ac(v.boxed.box_size, bs)
 
     bs = v.boxed.box_size
@@ -82,15 +94,16 @@ def test_waveform_view(qtbot, tempdir):
     # Simulate channel selection.
     _clicked = []
 
-    @v.gui.connect_
-    def on_channel_click(channel_id=None, button=None, key=None):
+    @connect(sender=v)
+    def on_select_channel(sender, channel_id=None, button=None, key=None):
         _clicked.append((channel_id, button, key))
 
-    v.events.key_press(key=keys.Key('2'))
-    v.events.mouse_press(pos=(0., 0.), button=1)
-    v.events.key_release(key=keys.Key('2'))
+    key_press(qtbot, v.canvas, '2')
+    mouse_click(qtbot, v.canvas, pos=(0., 0.), button='Left')
+    key_release(qtbot, v.canvas, '2')
 
-    assert _clicked == [(0, 1, 2)]
+    assert _clicked == [(2, 'Left', 2)]
 
-    # qtbot.stop()
-    gui.close()
+    v.set_state(v.state)
+
+    _stop_and_close(qtbot, v)

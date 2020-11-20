@@ -7,273 +7,198 @@
 # Imports
 #------------------------------------------------------------------------------
 
+import os
+
 import numpy as np
-from numpy.testing import assert_array_equal as ae
-from vispy.util import keys
+from pytest import fixture
 
-from ..panzoom import PanZoom
-from ..plot import View
-from ..transform import NDC
-from ..utils import _get_linear_x
+from phy.gui import GUI
+from ..plot import PlotCanvas, PlotCanvasMpl
+from ..utils import get_linear_x
+from ..visuals import PlotVisual, TextVisual
 
 
 #------------------------------------------------------------------------------
-# Utils
+# Fixtures
 #------------------------------------------------------------------------------
 
-def _show(qtbot, view, stop=False):
-    view.build()
-    view.show()
-    qtbot.waitForWindowShown(view.native)
-    if stop:  # pragma: no cover
-        qtbot.stop()
-    view.close()
+@fixture
+def x():
+    return .25 * np.random.randn(1000)
+
+
+@fixture
+def y():
+    return .25 * np.random.randn(1000)
 
 
 #------------------------------------------------------------------------------
 # Test plotting interface
 #------------------------------------------------------------------------------
 
-def test_building(qtbot):
-    view = View(keys='interactive')
-    n = 1000
-
-    x = np.random.randn(n)
-    y = np.random.randn(n)
-
-    with view.building():
-        view.scatter(x, y)
-
-    view.show()
-    qtbot.waitForWindowShown(view.native)
-    view.close()
+@fixture(params=[True, False])
+def canvas(request, qtbot):
+    c = PlotCanvas() if request.param else PlotCanvasMpl()
+    yield c
+    c.show()
+    qtbot.waitForWindowShown(c.canvas)
+    if os.environ.get('PHY_TEST_STOP', None):
+        qtbot.stop()
+    c.close()
 
 
-def test_simple_view(qtbot):
-    view = View()
-    n = 1000
-
-    x = np.random.randn(n)
-    y = np.random.randn(n)
-
-    view.scatter(x, y)
-    _show(qtbot, view)
-
-
-def test_uniform_scatter(qtbot):
-    view = View()
-    n = 1000
-
-    x = np.random.randn(n)
-    y = np.random.randn(n)
-
-    view.uscatter(x, y,
-                  color=(1., 1., 0., .5),
-                  size=40,
-                  )
-    _show(qtbot, view)
+def test_plot_0(qtbot, x, y):
+    c = PlotCanvas()
+    c.has_axes = True
+    c.has_lasso = True
+    c.scatter(x=x, y=y)
+    c.show()
+    qtbot.waitForWindowShown(c.canvas)
+    #c._enable()
+    c.close()
 
 
-#------------------------------------------------------------------------------
-# Test visuals in grid
-#------------------------------------------------------------------------------
+def test_plot_1(canvas, x, y):
+    c = canvas
+    c.scatter(x=x, y=y)
+    c.enable_axes()
+    c.enable_lasso()
 
-def test_grid_scatter(qtbot):
-    view = View(layout='grid', shape=(2, 3))
-    n = 100
 
-    assert isinstance(view.panzoom, PanZoom)
+def test_plot_grid(canvas, x, y):
+    c = canvas
+    c.set_layout('grid', shape=(2, 3))
 
-    x = np.random.randn(n)
-    y = np.random.randn(n)
+    c[0, 0].plot(x=x, y=y)
+    c[0, 1].hist(5 + x[::10])
+    c[0, 2].scatter(x, y, color=np.random.uniform(.5, .8, size=(1000, 4)))
 
-    view[0, 1].scatter(x, y)
-    view[0, 2].scatter(x, y, color=np.random.uniform(.5, .8, size=(n, 4)))
-
-    view[1, 0].scatter(x, y, size=np.random.uniform(5, 20, size=n))
-    view[1, 1]
+    c[1, 0].lines(pos=[-1, -.5, +1, -.5])
+    c[1, 1].text(pos=(0, 0), text='Hello world!', anchor=(0., 0.))
+    c[1, 1].polygon(pos=np.random.rand(5, 2))
 
     # Multiple scatters in the same subplot.
-    view[1, 2].scatter(x[2::6], y[2::6], marker='asterisk',
-                       color=(0, 1, 0, .25), size=20)
-    view[1, 2].scatter(x[::5], y[::5], marker='heart',
-                       color=(1, 0, 0, .35), size=50)
-    view[1, 2].scatter(x[1::3], y[1::3], marker='heart',
-                       color=(1, 0, 1, .35), size=30)
-
-    _show(qtbot, view)
+    c[1, 2].scatter(x[2::6], y[2::6], color=(0, 1, 0, .25), size=20, marker='asterisk')
+    c[1, 2].scatter(x[::5], y[::5], color=(1, 0, 0, .35), size=50, marker='heart')
+    c[1, 2].scatter(x[1::3], y[1::3], color=(1, 0, 1, .35), size=30, marker='heart')
 
 
-def test_grid_plot(qtbot):
-    view = View(layout='grid', shape=(1, 2))
-    n_plots, n_samples = 5, 50
+def test_plot_stacked(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+    c = canvas
+    c.set_layout('stacked', n_plots=3)
 
-    x = _get_linear_x(n_plots, n_samples)
-    y = np.random.randn(n_plots, n_samples)
+    t = get_linear_x(1, 1000).ravel()
+    c[0].scatter(pos=np.random.rand(100, 2))
 
-    view[0, 0].plot(x, y)
-    view[0, 1].plot(x, y, color=np.random.uniform(.5, .8, size=(n_plots, 4)))
+    c[1].hist(np.random.rand(5, 10), color=np.random.uniform(.4, .9, size=(5, 4)))
 
-    _show(qtbot, view)
-
-
-def test_grid_plot_uniform(qtbot):
-    view = View(layout='grid', shape=(1, 2))
-    n_plots, n_samples = 5, 50
-
-    x = _get_linear_x(n_plots, n_samples)
-    y = np.random.randn(n_plots, n_samples)
-
-    view[0, 0].uplot(x, y)
-    view[0, 1].uplot(x, y, color=(1., 1., 0., .5))
-
-    _show(qtbot, view)
+    c[2].plot(t, np.sin(20 * t), color=(1, 0, 0, 1))
 
 
-def test_grid_hist(qtbot):
-    view = View(layout='grid', shape=(3, 3))
+def test_plot_boxed(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+    c = canvas
 
-    hist = np.random.rand(3, 3, 20)
-
-    for i in range(3):
-        for j in range(3):
-            view[i, j].hist(hist[i, j, :],
-                            color=np.random.uniform(.5, .8, size=4))
-
-    _show(qtbot, view)
-
-
-def test_grid_lines(qtbot):
-    view = View(layout='grid', shape=(1, 2))
-
-    view[0, 0].lines(pos=[-1, -.5, +1, -.5])
-    view[0, 1].lines(pos=[-1, +.5, +1, +.5])
-
-    _show(qtbot, view)
-
-
-def test_grid_text(qtbot):
-    view = View(layout='grid', shape=(2, 1))
-
-    view[0, 0].text(pos=(0, 0), text='Hello world!', anchor=(0., 0.))
-    view[1, 0].text(pos=[[-.5, 0], [+.5, 0]], text=['|', ':)'])
-
-    _show(qtbot, view)
-
-
-def test_grid_complete(qtbot):
-    view = View(layout='grid', shape=(2, 2))
-    t = _get_linear_x(1, 1000).ravel()
-
-    view[0, 0].scatter(*np.random.randn(2, 100))
-    view[0, 1].plot(t, np.sin(20 * t), color=(1, 0, 0, 1))
-
-    view[1, 1].hist(np.random.rand(5, 10),
-                    color=np.random.uniform(.4, .9, size=(5, 4)))
-
-    _show(qtbot, view)
-
-
-#------------------------------------------------------------------------------
-# Test other interact
-#------------------------------------------------------------------------------
-
-def test_stacked_complete(qtbot):
-    view = View(layout='stacked', n_plots=3)
-
-    t = _get_linear_x(1, 1000).ravel()
-    view[0].scatter(*np.random.randn(2, 100))
-
-    # Different types of visuals in the same subplot.
-    view[1].hist(np.random.rand(5, 10),
-                 color=np.random.uniform(.4, .9, size=(5, 4)))
-    view[1].plot(t, np.sin(20 * t), color=(1, 0, 0, 1))
-
-    # TODO
-    # v = view[2].plot(t[::2], np.sin(20 * t[::2]), color=(1, 0, 0, 1))
-    # v.update(color=(0, 1, 0, 1))
-
-    _show(qtbot, view)
-
-
-def test_boxed_complete(qtbot):
     n = 3
-    b = np.zeros((n, 4))
-    b[:, 0] = b[:, 1] = np.linspace(-1., 1. - 2. / 3., n)
-    b[:, 2] = b[:, 3] = np.linspace(-1. + 2. / 3., 1., n)
-    view = View(layout='boxed', box_bounds=b)
+    b = np.zeros((n, 2))
+    b[:, 0] = np.linspace(-1., 1., n)
+    b[:, 1] = np.linspace(-1., 1., n)
+    c.set_layout('boxed', box_pos=b)
 
-    t = _get_linear_x(1, 1000).ravel()
-    view[0].scatter(*np.random.randn(2, 100))
-    view[1].plot(t, np.sin(20 * t), color=(1, 0, 0, 1))
-    view[2].hist(np.random.rand(5, 10),
-                 color=np.random.uniform(.4, .9, size=(5, 4)))
+    t = get_linear_x(1, 1000).ravel()
+    c[0].scatter(pos=np.random.rand(100, 2))
+    c[1].plot(t, np.sin(20 * t), color=(1, 0, 0, 1))
+    c[2].hist(np.random.rand(5, 10), color=np.random.uniform(.4, .9, size=(5, 4)))
 
-    _show(qtbot, view)
+
+def test_plot_uplot(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+    x, y = .25 * np.random.randn(2, 1000)
+    canvas.uplot(x=x, y=y)
+
+
+def test_plot_uscatter(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+    x, y = .25 * np.random.randn(2, 1000)
+    canvas.uscatter(x=x, y=y)
+
+
+def test_plot_batch_1(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+
+    visual = PlotVisual()
+
+    for size in (3, 5):
+        x = np.linspace(-1, 1, size)
+        y = np.random.uniform(0, 1, size)
+        visual.add_batch_data(x=x, y=y)
+
+    canvas.add_visual(visual)
+
+
+def test_plot_batch_2(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+
+    canvas.set_layout('grid', shape=(2, 1))
+
+    visual = PlotVisual()
+    visual.reset_batch()
+
+    for i, size in enumerate((3, 5)):
+        x = np.linspace(-1, 1, size)
+        y = np.random.uniform(-1, 1, size)
+        visual.add_batch_data(x=x, y=y, box_index=(i, 0))
+
+    canvas.add_visual(visual)
+
+
+def test_plot_batch_3(qtbot, canvas):
+    if isinstance(canvas, PlotCanvasMpl):
+        # TODO: not implemented yet
+        return
+
+    canvas.set_layout('grid', shape=(2, 1))
+
+    visual = TextVisual()
+    canvas.add_visual(visual)
+
+    visual.add_batch_data(
+        pos=np.zeros((5, 2)), text=["a" * (i + 1) for i in range(5)],
+        data_bounds=None, box_index=(0, 0))
+
+    visual.add_batch_data(
+        pos=np.zeros((7, 2)), text=["a" * (i + 1) for i in range(7)],
+        data_bounds=(-1, -1, 1, 1), box_index=(0, 1))
+
+    canvas.update_visual(visual)
 
 
 #------------------------------------------------------------------------------
-# Test lasso
+# Test matplotlib plotting
 #------------------------------------------------------------------------------
 
-def test_lasso_simple(qtbot):
-    view = View(enable_lasso=True, keys='interactive')
-    n = 1000
+def test_plot_mpl_1(qtbot):
+    gui = GUI()
+    c = PlotCanvasMpl()
 
-    x = np.random.randn(n)
-    y = np.random.randn(n)
+    c.clear()
+    c.attach(gui)
 
-    view.scatter(x, y)
-
-    l = view.lasso
-    ev = view.events
-    ev.mouse_press(pos=(0, 0), button=1, modifiers=(keys.CONTROL,))
-    l.add((+1, -1))
-    l.add((+1, +1))
-    l.add((-1, +1))
-    assert l.count == 4
-    assert l.polygon.shape == (4, 2)
-    b = [[-1, -1], [+1, -1], [+1, +1], [-1, +1]]
-    ae(l.in_polygon(b), [False, False, True, True])
-
-    ev.mouse_press(pos=(0, 0), button=2, modifiers=(keys.CONTROL,))
-    assert l.count == 0
-
-    _show(qtbot, view)
-
-
-def test_lasso_grid(qtbot):
-    view = View(layout='grid', shape=(1, 2),
-                enable_lasso=True, keys='interactive')
-    x, y = np.meshgrid(np.linspace(-1., 1., 20), np.linspace(-1., 1., 20))
-    x, y = x.ravel(), y.ravel()
-    view[0, 1].scatter(x, y, data_bounds=NDC)
-
-    l = view.lasso
-    ev = view.events
-
-    # Square selection in the left panel.
-    ev.mouse_press(pos=(100, 100), button=1, modifiers=(keys.CONTROL,))
-    assert l.box == (0, 0)
-    ev.mouse_press(pos=(200, 100), button=1, modifiers=(keys.CONTROL,))
-    ev.mouse_press(pos=(200, 200), button=1, modifiers=(keys.CONTROL,))
-    ev.mouse_press(pos=(100, 200), button=1, modifiers=(keys.CONTROL,))
-    assert l.box == (0, 0)
-
-    # Clear.
-    ev.mouse_press(pos=(100, 200), button=2, modifiers=(keys.CONTROL,))
-    assert l.box is None
-
-    # Square selection in the right panel.
-    ev.mouse_press(pos=(500, 100), button=1, modifiers=(keys.CONTROL,))
-    assert l.box == (0, 1)
-    ev.mouse_press(pos=(700, 100), button=1, modifiers=(keys.CONTROL,))
-    ev.mouse_press(pos=(700, 300), button=1, modifiers=(keys.CONTROL,))
-    ev.mouse_press(pos=(500, 300), button=1, modifiers=(keys.CONTROL,))
-    assert l.box == (0, 1)
-
-    ind = l.in_polygon(np.c_[x, y])
-    view[0, 1].scatter(x[ind], y[ind], color=(1., 0., 0., 1.),
-                       data_bounds=NDC)
-
-    _show(qtbot, view)
+    c.show()
+    qtbot.waitForWindowShown(c.canvas)
+    if os.environ.get('PHY_TEST_STOP', None):
+        qtbot.stop()
+    c.close()

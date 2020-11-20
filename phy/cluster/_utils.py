@@ -6,12 +6,13 @@
 # Imports
 #------------------------------------------------------------------------------
 
+import numpy as np
+
 from copy import deepcopy
-from collections import defaultdict
 import logging
 
 from ._history import History
-from phy.utils import Bunch, _as_list, _is_list, EventEmitter
+from phylib.utils import Bunch, _as_list, _is_list, emit, silent
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +50,52 @@ def create_cluster_meta(cluster_groups):
 #------------------------------------------------------------------------------
 
 class UpdateInfo(Bunch):
-    """Hold information about clustering changes."""
+    """Object created every time the dataset is modified via a clustering or cluster metadata
+    action. It is passed to event callbacks that react to these changes. Derive from Bunch.
+
+    Parameters
+    ----------
+
+    description : str
+        Information about the update: merge, assign, or metadata_xxx for metadata changes
+    history : str
+        undo, redo, or None
+    spike_ids : array-like
+        All spike ids that were affected by the clustering action.
+    added : list
+        List of new cluster ids.
+    deleted : list
+        List of cluster ids that were deleted during the action. There are no modified clusters:
+        every change triggers the deletion of and addition of clusters.
+    descendants : list
+        List of pairs (old_cluster_id, new_cluster_id), used to track the history of
+        the clusters.
+    metadata_changed : list
+        List of cluster ids that had a change of metadata.
+    metadata_value : str
+        The new metadata value for the affected change.
+    undo_state : Bunch
+        Returned during an undo, it contains information about the undone action. This is used
+        when redoing the undone action.
+
+    """
     def __init__(self, **kwargs):
         d = dict(
-            description='',  # information about the update: 'merge', 'assign',
-                             # or 'metadata_<name>'
-            history=None,  # None, 'undo', or 'redo'
-            spike_ids=[],  # all spikes affected by the update
-            added=[],  # new clusters
-            deleted=[],  # deleted clusters
-            descendants=[],  # pairs of (old_cluster, new_cluster)
-            metadata_changed=[],  # clusters with changed metadata
-            metadata_value=None,  # new metadata value
-            undo_state=None,  # returned during an undo: it contains
-                              # information about the undone action
+            description='',
+            history=None,
+            spike_ids=[],
+            added=[],
+            deleted=[],
+            descendants=[],
+            metadata_changed=[],
+            metadata_value=None,
+            undo_state=None,
         )
         d.update(kwargs)
         super(UpdateInfo, self).__init__(d)
+        # NOTE: we have to ensure we only use native types and not NumPy arrays so that
+        # the history stack works correctly.
+        assert all(not isinstance(v, np.ndarray) for v in self.values())
 
     def __repr__(self):
         desc = self.description
@@ -74,19 +104,13 @@ class UpdateInfo(Bunch):
             return '<UpdateInfo>'
         elif desc in ('merge', 'assign'):
             a, d = _join(self.added), _join(self.deleted)
-            return '<{desc}{h} {d} => {a}>'.format(desc=desc,
-                                                   a=a,
-                                                   d=d,
-                                                   h=h,
-                                                   )
+            return '<{desc}{h} {d} => {a}>'.format(
+                desc=desc, a=a, d=d, h=h)
         elif desc.startswith('metadata'):
             c = _join(self.metadata_changed)
             m = self.metadata_value
-            return '<{desc}{h} {c} => {m}>'.format(desc=desc,
-                                                   c=c,
-                                                   m=m,
-                                                   h=h,
-                                                   )
+            return '<{desc}{h} {c} => {m}>'.format(
+                desc=desc, c=c, m=m, h=h)
         return '<UpdateInfo>'
 
 
@@ -94,10 +118,9 @@ class UpdateInfo(Bunch):
 # ClusterMetadataUpdater class
 #------------------------------------------------------------------------------
 
-class ClusterMeta(EventEmitter):
+class ClusterMeta(object):
     """Handle cluster metadata changes."""
     def __init__(self):
-        super(ClusterMeta, self).__init__()
         self._fields = {}
         self._reset_data()
 
@@ -123,22 +146,41 @@ class ClusterMeta(EventEmitter):
         setattr(self, name, func)
 
     def from_dict(self, dic):
-        """Import data from a {cluster: {field: value}} dictionary."""
-        self._reset_data()
-        for cluster, vals in dic.items():
-            for field, value in vals.items():
-                self.set(field, [cluster], value, add_to_stack=False)
+        """Import data from a `{cluster_id: {field: value}}` dictionary."""
+        #self._reset_data()
+        # Do not raise events here.
+        with silent():
+            for cluster, vals in dic.items():
+                for field, value in vals.items():
+                    self.set(field, [cluster], value, add_to_stack=False)
         self._data_base = deepcopy(self._data)
 
     def to_dict(self, field):
-        """Export data to a {cluster: value} dictionary, for a particular
-        field."""
+        """Export data to a `{cluster_id: value}` dictionary, for a particular field."""
         assert field in self._fields, "This field doesn't exist"
-        return {cluster: self.get(field, cluster)
-                for cluster in self._data.keys()}
+        return {cluster: self.get(field, cluster) for cluster in self._data.keys()}
 
     def set(self, field, clusters, value, add_to_stack=True):
-        """Set the value of one of several clusters."""
+        """Set the value of one of several clusters.
+
+        Parameters
+        ----------
+
+        field : str
+            The field to set.
+        clusters : list
+            The list of cluster ids to change.
+        value : str
+            The new metadata value for the given clusters.
+        add_to_stack : boolean
+            Whether this metadata change should be recorded in the undo stack.
+
+        Returns
+        -------
+
+        up : UpdateInfo instance
+
+        """
         # Add the field if it doesn't exist.
         if field not in self._fields:
             self.add_field(field)
@@ -154,42 +196,63 @@ class ClusterMeta(EventEmitter):
                         metadata_changed=clusters,
                         metadata_value=value,
                         )
-        undo_state = self.emit('request_undo_state', up)
+        undo_state = emit('request_undo_state', self, up)
 
         if add_to_stack:
             self._undo_stack.add((clusters, field, value, up, undo_state))
-            self.emit('cluster', up)
+            emit('cluster', self, up)
 
         return up
 
     def get(self, field, cluster):
-        """Retrieve the value of one cluster."""
+        """Retrieve the value of one cluster for a given field."""
         if _is_list(cluster):
             return [self.get(field, c) for c in cluster]
         assert field in self._fields
-        default = self._fields[field]
-        return self._data.get(cluster, {}).get(field, default)
+        return self._data.get(cluster, {}).get(field, self._fields[field])
 
-    def set_from_descendants(self, descendants):
-        """Update metadata of some clusters given the metadata of their
-        ascendants."""
+    def set_from_descendants(self, descendants, largest_old_cluster=None):
+        """Update metadata of some clusters given the metadata of their ascendants.
+
+        Parameters
+        ----------
+
+        descendants : list
+            List of pairs (old_cluster_id, new_cluster_id)
+        largest_old_cluster : int
+            If available, the cluster id of the largest old cluster, used as a reference.
+
+        """
         for field in self.fields:
-
-            # This gives a set of metadata values of all the parents
-            # of any new cluster.
-            candidates = defaultdict(set)
-            for old, new in descendants:
-                candidates[new].add(self.get(field, old))
-
-            # Loop over all new clusters.
-            for new, vals in candidates.items():
-                vals = list(vals)
-                default = self._fields[field]
-                # If all the parents have the same value, assign it to
-                # the new cluster if it is not the default.
-                if len(vals) == 1 and vals[0] != default:
-                    self.set(field, new, vals[0])
-                # Otherwise, the default is assumed.
+            # Consider the default value for the current field.
+            default = self._fields[field]
+            # This maps old cluster ids to their values.
+            old_values = {old: self.get(field, old) for old, _ in descendants}
+            # This is the set of new clusters.
+            new_clusters = set(new for _, new in descendants)
+            # This is the set of old non-default values.
+            old_values_set = set(old_values.values())
+            if default in old_values_set:
+                old_values_set.remove(default)
+            # old_values_set contains all non-default values of the modified clusters.
+            n = len(old_values_set)
+            if n == 0:
+                # If this set is empty, it means no old clusters had a value.
+                continue
+            elif n == 1:
+                # If all old clusters had the same non-default value, this will be the
+                # value of the new clusters.
+                new_value = old_values_set.pop()
+            else:
+                # Otherwise, there is a conflict between several possible old values.
+                # We ensure that the largest old cluster is specified.
+                assert largest_old_cluster is not None
+                # We choose this value.
+                new_value = old_values[largest_old_cluster]
+            # Set the new value to all new clusters that don't already have a non-default value.
+            for new in new_clusters:
+                if self.get(field, new) == default:
+                    self.set(field, new, new_value, add_to_stack=False)
 
     def undo(self):
         """Undo the last metadata change.
@@ -213,7 +276,7 @@ class ClusterMeta(EventEmitter):
         up.history = 'undo'
         up.undo_state = undo_state
 
-        self.emit('cluster', up)
+        emit('cluster', self, up)
         return up
 
     def redo(self):
@@ -223,6 +286,7 @@ class ClusterMeta(EventEmitter):
         -------
 
         up : UpdateInfo instance
+
         """
         args = self._undo_stack.forward()
         if args is None:
@@ -233,5 +297,62 @@ class ClusterMeta(EventEmitter):
         # Return the UpdateInfo instance of the redo action.
         up.history = 'redo'
 
-        self.emit('cluster', up)
+        emit('cluster', self, up)
         return up
+
+
+# -----------------------------------------------------------------------------
+# Property cycle
+# -----------------------------------------------------------------------------
+
+class RotatingProperty(object):
+    """A key-value property of a view that can switch between several predefined values."""
+    def __init__(self):
+        self._choices = {}
+        self._current = None
+
+    def add(self, name, value):
+        """Add a property key-value pair."""
+        self._choices[name] = value
+        if self._current is None:
+            self._current = name
+
+    @property
+    def current(self):
+        """Current key."""
+        return self._current
+
+    def keys(self):
+        return list(self._choices)
+
+    def get(self, name=None):
+        """Get the current value."""
+        name = name or self._current
+        return self._choices.get(name, None)
+
+    def set(self, name):
+        """Set the current key."""
+        if name in self._choices:
+            self._current = name
+        return self.get()
+
+    def _neighbor(self, dir=+1):
+        ks = list(self._choices.keys())
+        n = len(ks)
+        i = ks.index(self._current)
+        i += dir
+        if i == n:
+            i = 0
+        if i == -1:
+            i = n - 1
+        assert 0 <= i < len(self._choices)
+        self._current = ks[i]
+        return self.current
+
+    def next(self):
+        """Select the next key-value pair."""
+        return self._neighbor(+1)
+
+    def previous(self):
+        """Select the previous key-value pair."""
+        return self._neighbor(-1)

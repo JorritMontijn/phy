@@ -43,9 +43,11 @@ class History(object):
         assert len(self._history) >= 1
 
     def is_first(self):
+        """Whether we are at the beginning of the stack."""
         return self._index == 1
 
     def is_last(self):
+        """Whether we are at the end of the stack."""
         return self._index == len(self._history) - 1
 
     def iter(self, start=0, end=None):
@@ -53,19 +55,19 @@ class History(object):
 
         Parameters
         ----------
-        end : int
-            Index of the last item to loop through + 1.
 
         start : int
-            Initial index for the loop (0 by default).
+            Initial index for the loop.
+        end : int
+            Index of the last item to loop through + 1.
 
         """
         if end is None:
             end = self._index + 1
         elif end == 0:
-            raise StopIteration()
+            return
         if start >= end:
-            raise StopIteration()
+            return
         # Check arguments.
         assert 0 <= end <= len(self._history)
         assert 0 <= start <= end - 1
@@ -105,6 +107,7 @@ class History(object):
         return undone
 
     def undo(self):
+        """Alias to back()."""
         return self.back()
 
     def forward(self):
